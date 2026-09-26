@@ -236,19 +236,23 @@ Batch and sequence accept a top-level `session_id` and per-entry `session_id` va
 
 ```js
 import { ExecutionClient } from './index.js';
-const c = new ExecutionClient('http://localhost:3000');
+const c = new ExecutionClient('http://localhost:3000', { token: process.env.MARSHALLD_API_TOKEN });
 await c.execute('shell', { program: '/bin/echo', args: ['hi'] });
+const { session_id: SID } = await c.createSession('demo');
 await c.batch([['shell', { program: '/bin/echo', args: ['hi'] }]], { sessionId: SID });
 for await (const evt of c.stream('shell', { program: '/bin/echo', args: ['hi'] })) console.log(evt);
+await c.deleteSession(SID);
 ```
 
 ```python
 from marshall_sdk import ExecutionClient
-c = ExecutionClient("http://localhost:3000")
+c = ExecutionClient("http://localhost:3000", token="...")
 c.execute("shell", {"program": "/bin/echo", "args": ["hi"]})
+SID = c.create_session("demo")["session_id"]
 c.batch([("shell", {"program": "/bin/echo", "args": ["hi"]})], session_id=SID)
 for event, data in c.stream("shell", {"program": "/bin/echo", "args": ["hi"]}):
     print(event, data)
+c.delete_session(SID)
 ```
 
 ## Deployment
