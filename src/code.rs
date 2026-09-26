@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 //! Code execution tool — python/javascript/bash via sandboxed backend.
 //!
 //! Like `executor.sh` code cells, this runs a snippet in a sandbox with
@@ -17,19 +16,27 @@ use crate::backend::{ExecRequest, ExecutionBackend, LocalProcessBackend, Resourc
 use crate::sandbox::Sandbox;
 use crate::{sha256_hex, Tool, ToolOutcome};
 
+/// Default wall-clock limit for a snippet.
 pub const DEFAULT_CODE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default cap on combined stdout and stderr, in bytes.
 pub const DEFAULT_CODE_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// Largest snippet accepted, in bytes. Source arrives over the wire, so it is
+/// bounded before it reaches a temporary file.
 pub const MAX_CODE_BYTES: usize = 64 * 1024;
 
 /// Languages the tool can run. Allowlist is deny-by-default like `HttpTool`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Language {
+    /// `python`, run through the interpreter found on `PATH` at construction.
     Python,
+    /// `javascript`, run through `node`.
     JavaScript,
+    /// `bash`. Equivalent to an unrestricted shell, and worth naming as such.
     Bash,
 }
 
 impl Language {
+    /// The canonical name used in policy files and tool arguments.
     pub fn as_str(&self) -> &'static str {
         match self {
             Language::Python => "python",
@@ -38,6 +45,7 @@ impl Language {
         }
     }
 
+    /// Parse a language name, accepting the common aliases (`py`, `js`, `sh`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "python" | "py" | "python3" => Some(Language::Python),
@@ -73,6 +81,7 @@ impl std::fmt::Debug for CodeTool {
 }
 
 impl CodeTool {
+    /// A tool that runs nothing. Every language must be allowed explicitly.
     pub fn new() -> Self {
         Self {
             sandbox: None,
@@ -88,31 +97,46 @@ impl CodeTool {
         }
     }
 
+    /// Run snippets with their working directory inside `sandbox`.
+    ///
+    /// This bounds where the snippet *starts*, not what it can reach: on the
+    /// local backend it can still open any path the process can open.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.sandbox = Some(sandbox);
         self
     }
 
+    /// Run snippets through `backend` instead of the local process backend.
+    ///
+    /// This is the only way to get real isolation for this tool.
     pub fn with_backend(mut self, backend: Arc<dyn ExecutionBackend>) -> Self {
         self.backend = backend;
         self
     }
 
+    /// Wall-clock limit per snippet.
     pub fn with_timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
     }
 
+    /// Cap on combined stdout and stderr, clamped to 16 MiB.
     pub fn with_output_limit(mut self, n: usize) -> Self {
         self.output_limit = n.clamp(1, 16 * 1024 * 1024);
         self
     }
 
+    /// Permit one language.
     pub fn allow_language(mut self, lang: Language) -> Self {
         self.allowed.insert(lang);
         self
     }
 
+    /// Permit every language this tool knows.
+    ///
+    /// On the local backend this grants arbitrary code execution with the
+    /// daemon's privileges. [`crate::policy::CodePolicy`] requires a separate
+    /// acknowledgement before it will do this from a config file.
     pub fn allow_all(mut self) -> Self {
         self.allowed.insert(Language::Python);
         self.allowed.insert(Language::JavaScript);
@@ -120,6 +144,7 @@ impl CodeTool {
         self
     }
 
+    /// Permit several languages at once.
     pub fn with_allowed_languages<I>(mut self, langs: I) -> Self
     where
         I: IntoIterator<Item = Language>,
@@ -130,21 +155,27 @@ impl CodeTool {
         self
     }
 
+    /// Override the python interpreter, instead of the one found on `PATH`.
     pub fn with_python_path(mut self, p: impl Into<PathBuf>) -> Self {
         self.python_path = p.into();
         self
     }
 
+    /// Override the node binary, instead of the one found on `PATH`.
     pub fn with_node_path(mut self, p: impl Into<PathBuf>) -> Self {
         self.node_path = p.into();
         self
     }
 
+    /// Set one environment variable for the snippet.
     pub fn with_env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.extra_env.push((k.into(), v.into()));
         self
     }
 
+    /// Pass through only these variables from the parent environment.
+    ///
+    /// Absent clears the environment entirely, which is the default.
     pub fn with_allowed_env<I, S>(mut self, vars: I) -> Self
     where
         I: IntoIterator<Item = S>,

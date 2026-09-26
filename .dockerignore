@@ -1,0 +1,6 @@
+target/
+.git/
+validation/
+audit.jsonl
+*.md
+!README.md

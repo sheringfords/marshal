@@ -47,14 +47,22 @@ pub mod code;
 pub mod destination;
 pub mod egress;
 pub mod error;
+/// The validation harness used to produce `validation/`.
+///
+/// Behind the `experiment` feature: it is a research artifact, and shipping it
+/// in the default API means committing to its shape at 1.0. Nothing in the
+/// library depends on it.
+#[cfg(feature = "experiment")]
 pub mod experiment;
 pub mod fs;
 pub mod http;
 pub mod limits;
 pub mod policy;
+pub mod ratelimit;
 pub mod redaction;
 pub mod registry;
 pub mod sandbox;
+pub mod server;
 pub mod shell;
 pub mod system;
 
@@ -78,9 +86,11 @@ pub use fs::FileSystemTool;
 pub use http::HttpTool;
 pub use limits::Limits;
 pub use policy::ExecutionPolicy;
+pub use ratelimit::{RateLimit, RateLimiter};
 pub use redaction::REDACTION_POLICY_VERSION;
 pub use registry::{ToolDefinition, ToolRegistry};
 pub use sandbox::{Sandbox, SandboxError};
+pub use server::ServerConfig;
 pub use shell::{ArgumentPolicy, ShellTool};
 pub use system::{SystemPolicy, SystemTool};
 

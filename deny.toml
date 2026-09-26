@@ -1,0 +1,40 @@
+# cargo-deny configuration.
+#
+# The point of this file in a crate like this one: a security tool inherits the
+# security of its dependency tree, and "we run cargo audit" was not true while
+# the job was `continue-on-error`.
+
+[advisories]
+yanked = "deny"
+# Advisories to accept, each with a reason and a link. Empty is the goal.
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+# Exactly what is in the tree today, and nothing aspirational: a new license
+# showing up should be a decision someone makes, not a silent pass.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # notify, the config file watcher. A public-domain dedication.
+    "CC0-1.0",
+    # webpki-roots, the trust anchors rustls verifies against.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# No git dependencies remain: the `watchdog` container dependency was removed
+# (MAR-P0-002 — the assumed Firecracker API never existed at the pinned
+# revision, and the silent local fallback was a downgrade). `allow-git` stays
+# empty so reintroducing an unpublished dependency fails the build.
+allow-git = []

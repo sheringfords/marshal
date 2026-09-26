@@ -9,16 +9,19 @@
 //! ToolRegistry -> ShellTool (policy) -> ExecutionBackend (mechanism)
 //!                                    ├─ LocalProcessBackend (dev, current)
 //!                                    ├─ WasmBackend (wasmtime fuel/memory)
-//!                                    └─ ContainerBackend (watchdog/Firecracker)
+//!                                    └─ ContainerBackend (fail-closed placeholder;
+//!                                       no isolation runtime is wired yet)
 //! ```
 //!
 //! This module provides the trait and the `LocalProcessBackend` implementation.
-//! `WasmBackend` is scaffolded behind the `wasm` feature flag — without it the
-//! type exists but returns `unsupported`.
+//! `WasmBackend` runs wasm modules behind the `wasm` feature flag (wasmtime
+//! with fuel, memory, and epoch-timeout enforcement, and a two-function WASI
+//! subset) — without the feature the type exists but returns `unsupported`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(feature = "wasm")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +31,11 @@ use std::os::unix::process::CommandExt;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+#[cfg(feature = "wasm")]
+use std::sync::Mutex;
+#[cfg(feature = "wasm")]
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 use crate::{sha256_hex, ToolOutcome};
 
@@ -91,8 +99,9 @@ pub struct ExecOutput {
 
 /// Backend that actually runs the request.
 ///
-/// `LocalProcessBackend` is the current behaviour. `WasmBackend`/`ContainerBackend`
-/// will enforce stronger isolation (seccomp/cgroup/Firecracker) via `watchdog`.
+/// `LocalProcessBackend` is the current behaviour. `WasmBackend` enforces
+/// fuel/memory/epoch limits on wasm modules; `ContainerBackend` is a
+/// fail-closed placeholder until a real isolation runtime is integrated.
 #[async_trait::async_trait]
 pub trait ExecutionBackend: Send + Sync + std::fmt::Debug {
     /// Human name for metrics/tracing (`local`, `wasm`, `container`).
@@ -338,7 +347,27 @@ impl ExecOutput {
 // WasmBackend — scaffolded, real impl behind `wasm` feature (wasmtime)
 // ---------------------------------------------------------------------------
 
-/// WASM execution backend. Without `wasm` feature this always returns `unsupported`.
+/// WASM execution backend: runs a WebAssembly module file with wasmtime.
+///
+/// The guest gets a deliberately minimal `wasi_snapshot_preview1` subset —
+/// `fd_write` (fd 1/2 only, into the capped stdout/stderr buffers) and
+/// `proc_exit` — and nothing else: no filesystem, no network, no clocks, no
+/// args/environ, no other WASI interface. A module importing anything beyond
+/// those two functions fails to link. Entry point is `_start`, falling back
+/// to `run`/`_run`.
+///
+/// Limits: `fuel` (or `limits.cpu_time` converted at 10_000 fuel/ms) bounds
+/// instructions, `memory_limit` (or `limits.memory_bytes`, unbounded when
+/// neither is set) caps linear memory via a `ResourceLimiter`, and
+/// `limits.timeout` is enforced by epoch interruption. Fuel/epoch exhaustion
+/// reports `timed_out: true` with no exit code, matching the local backend's
+/// timeout shape. Without the `wasm` feature this always returns
+/// `unsupported` — fail-closed, never silent.
+///
+/// Motorcycle-shed honesty: this is language-agnostic at the wasm level
+/// (anything that compiles to a freestanding wasm module using only those
+/// two imports runs), but it is not a Python/JS runtime — there is no
+/// interpreter embedded. Execution is synchronous on the calling task.
 #[derive(Debug, Default, Clone)]
 pub struct WasmBackend {
     /// Fuel limit (wasmtime) — maps to `ResourceLimits.cpu_time`.
@@ -371,15 +400,15 @@ impl ExecutionBackend for WasmBackend {
 #[cfg(feature = "wasm")]
 async fn execute_wasm(
     req: ExecRequest,
-    _fuel: Option<u64>,
-    _memory_limit: Option<u64>,
+    fuel: Option<u64>,
+    memory_limit: Option<u64>,
 ) -> anyhow::Result<ExecOutput> {
     let wasm_bytes = tokio::fs::read(&req.program)
         .await
         .map_err(|e| anyhow::anyhow!("wasm read failed: {e}"))?;
-    let _effective_fuel =
-        _fuel.or_else(|| req.limits.cpu_time.map(|d| d.as_millis() as u64 * 10_000));
-    let _effective_mem = _memory_limit.or(req.limits.memory_bytes);
+    let effective_fuel =
+        fuel.or_else(|| req.limits.cpu_time.map(|d| d.as_millis() as u64 * 10_000));
+    let effective_mem = memory_limit.or(req.limits.memory_bytes);
 
     let mut config = Config::new();
     config.consume_fuel(effective_fuel.is_some());
@@ -422,13 +451,15 @@ async fn execute_wasm(
     // Memory limiter
     store.limiter(|data| &mut data.limiter as &mut dyn wasmtime::ResourceLimiter);
 
-    // Epoch timeout
+    // Wall-clock timeout via epoch interruption. The call itself is
+    // synchronous and may never return on its own, so it runs on a blocking
+    // thread while this task watches the clock: on timeout the epoch is
+    // incremented, which traps the module promptly, and the blocking thread
+    // unwinds with that trap. (A `tokio::spawn` timer alone is not enough:
+    // on a single-threaded runtime it would never run while the guest
+    // spins, hanging the caller instead of timing it out.)
     let timeout = req.limits.timeout;
     let engine_clone = engine.clone();
-    let timeout_handle = tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        engine_clone.increment_epoch();
-    });
     store.set_epoch_deadline(1);
 
     let mut linker = Linker::new(&engine);
@@ -475,7 +506,7 @@ async fn execute_wasm(
                     let remaining = output_limit.saturating_sub(guard.len());
                     let to_write = remaining.min(bytes.len());
                     guard.extend_from_slice(&bytes[..to_write]);
-                    total_written += bytes.len();
+                    total_written += to_write;
                 }
                 // Write nwritten to memory
                 let mem_mut = memory.data_mut(&mut caller);
@@ -508,21 +539,47 @@ async fn execute_wasm(
         .or_else(|| instance.get_func(&mut store, "_run"))
         .ok_or_else(|| anyhow::anyhow!("wasm module has no _start/run export"))?;
 
-    let result = start.call(&mut store, &[], &mut []);
-    timeout_handle.abort();
+    let result = {
+        let mut call = tokio::task::spawn_blocking(move || start.call(&mut store, &[], &mut []));
+        tokio::select! {
+            joined = &mut call => {
+                joined.map_err(|e| anyhow::anyhow!("wasm join: {e}"))?
+            }
+            _ = tokio::time::sleep(timeout) => {
+                engine_clone.increment_epoch();
+                // The epoch trap stops the module; wait for it to unwind.
+                call.await.map_err(|e| anyhow::anyhow!("wasm join: {e}"))?
+            }
+        }
+    };
+
+    // wasmtime wraps host-function failures (including our `proc_exit`
+    // sentinel) in a trap error, so every match below walks the whole error
+    // chain instead of only the top-level message.
+    fn chain_text(e: &anyhow::Error) -> String {
+        e.chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
 
     let exit_code = match result {
         Ok(_) => Some(0),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("wasi_exit:") {
-                let code_str = msg.split("wasi_exit:").nth(1).unwrap_or("0").trim();
-                code_str.parse::<i32>().ok()
-            } else if msg.to_ascii_lowercase().contains("fuel")
-                || msg.to_ascii_lowercase().contains("epoch")
-                || msg.to_ascii_lowercase().contains("deadline")
-                || msg.to_ascii_lowercase().contains("interrupted")
-            {
+            let chained = chain_text(&e);
+            let lower = chained.to_ascii_lowercase();
+            let limit_exhausted = lower.contains("fuel")
+                || lower.contains("epoch")
+                || lower.contains("deadline")
+                || lower.contains("interrupt");
+            if let Some(code) = e.chain().find_map(|c| {
+                c.to_string()
+                    .split("wasi_exit:")
+                    .nth(1)
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+            }) {
+                Some(code)
+            } else if limit_exhausted {
                 let stdout = stdout_buf.lock().unwrap().clone();
                 let stderr = stderr_buf.lock().unwrap().clone();
                 let (out, out_trunc) = truncate_bytes(stdout, output_limit);
@@ -531,7 +588,7 @@ async fn execute_wasm(
                     exit_code: None,
                     stdout: out,
                     stderr: if err.is_empty() {
-                        format!("fuel or epoch exhausted: {e}").into_bytes()
+                        format!("fuel or epoch exhausted: {e:#}").into_bytes()
                     } else {
                         err
                     },
@@ -540,7 +597,25 @@ async fn execute_wasm(
                     timed_out: true,
                 });
             } else {
-                Some(1)
+                // A real guest trap (or link-time surprise at call time):
+                // keep any guest stderr, otherwise say what trapped so the
+                // caller is not left with a bare exit code.
+                let trap_note = format!("wasm trap: {e:#}");
+                let mut err_bytes = stderr_buf.lock().unwrap().clone();
+                if err_bytes.is_empty() {
+                    err_bytes = trap_note.into_bytes();
+                }
+                let stdout = stdout_buf.lock().unwrap().clone();
+                let (out, out_trunc) = truncate_bytes(stdout, output_limit);
+                let (err, err_trunc) = truncate_bytes(err_bytes, output_limit);
+                return Ok(ExecOutput {
+                    exit_code: Some(1),
+                    stdout: out,
+                    stderr: err,
+                    stdout_truncated: out_trunc,
+                    stderr_truncated: err_trunc,
+                    timed_out: false,
+                });
             }
         }
     };
@@ -594,23 +669,27 @@ fn truncate_bytes(mut v: Vec<u8>, limit: usize) -> (Vec<u8>, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// ContainerBackend — Firecracker via `watchdog` crate (Phase 4)
+// ContainerBackend — fail-closed placeholder (MAR-P0-002)
 // ---------------------------------------------------------------------------
 
-/// Container/Firecracker backend. Delegates to sibling `watchdog` crate for
-/// cgroup/seccomp/namespace. On macOS or without KVM, falls back to
-/// `LocalProcessBackend` with a warning.
+/// Container/microVM backend: currently a fail-closed placeholder.
 ///
-/// Wiring (see `docs/ARCHITECTURE.md:19`):
-/// ```text
-/// // Pool per workspace: watchdog::Pool::new(Config{
-/// //   kernel: "vmlinux", rootfs: "alpine.ext4", vsock: "/tmp/firecracker.sock",
-/// //   cgroup: Limits{ memory_bytes: Some(128<<20), pids_max: Some(64) },
-/// //   seccomp: true,
-/// // })
-/// // pool.exec(ExecRequest{ program: "/bin/bash", args: ["-c","echo hi"], ... }).await
-/// ```
-#[derive(Debug, Clone)]
+/// History: this type used to delegate to a `watchdog` crate behind the
+/// `container` feature, falling back to [`LocalProcessBackend`] with a
+/// warning when KVM was unavailable. That wiring was removed because the
+/// dependency it assumed does not exist — the pinned `watchdog` revision
+/// exposes a cgroup-supervisor API (`Supervisor`, `Bounds`), not the
+/// Firecracker `Pool`/`Config`/`ExecRequest` API the code called, so the
+/// feature never compiled, and the fallback silently ran isolated-labeled
+/// work without isolation.
+///
+/// Until a real, published isolation integration lands, `execute` refuses
+/// every request with an `isolation_unavailable` error instead of running
+/// it anywhere. The builder fields are kept so call sites and policy shapes
+/// survive the eventual integration. `name()` still reports `"container"`,
+/// and because nothing ever executes under it, the identity is honest: no
+/// outcome is ever attributed to isolation that did not happen.
+#[derive(Debug, Clone, Default)]
 pub struct ContainerBackend {
     /// Image or microVM kernel path (e.g. "alpine:3.19" or "/path/to/vmlinux").
     pub image: Option<String>,
@@ -620,20 +699,6 @@ pub struct ContainerBackend {
     pub rootfs: Option<PathBuf>,
     /// Vsock path for Firecracker communication.
     pub vsock: Option<PathBuf>,
-    /// Fallback backend for non-Linux or when KVM unavailable.
-    fallback: Arc<dyn ExecutionBackend>,
-}
-
-impl Default for ContainerBackend {
-    fn default() -> Self {
-        Self {
-            image: None,
-            kernel: None,
-            rootfs: None,
-            vsock: None,
-            fallback: Arc::new(LocalProcessBackend),
-        }
-    }
 }
 
 impl ContainerBackend {
@@ -657,12 +722,6 @@ impl ContainerBackend {
         self
     }
 
-    /// Set fallback backend (used on macOS).
-    pub fn with_fallback(mut self, backend: Arc<dyn ExecutionBackend>) -> Self {
-        self.fallback = backend;
-        self
-    }
-
     #[cfg(target_os = "linux")]
     fn is_kvm_available() -> bool {
         std::path::Path::new("/dev/kvm").exists()
@@ -681,101 +740,22 @@ impl ExecutionBackend for ContainerBackend {
     }
 
     async fn execute(&self, req: ExecRequest) -> anyhow::Result<ExecOutput> {
-        // On non-Linux or without KVM, fallback to local with warning is the
-        // documented behavior (docs/ARCHITECTURE.md:36).
-        if !Self::is_kvm_available() {
-            tracing::warn!(
-                image = ?self.image,
-                "kvm not available (macOS or /dev/kvm missing), falling back to LocalProcessBackend"
-            );
-            return self.fallback.execute(req).await;
+        let _ = req;
+        // Fail closed. An earlier revision fell back to LocalProcessBackend
+        // here with a warning; a warning is not a control, and the response
+        // still claimed the `container` backend. Refusing is the only honest
+        // behaviour until a real isolation integration exists.
+        if Self::is_kvm_available() {
+            anyhow::bail!(
+                "isolation_unavailable: container backend has no isolation integration \
+                 (kvm present but no runtime wired); refusing to execute"
+            )
+        } else {
+            anyhow::bail!(
+                "isolation_unavailable: container backend requires Linux KVM and an \
+                 isolation runtime; refusing to execute (no local fallback)"
+            )
         }
-
-        // If watchdog feature is enabled, delegate to it. Otherwise fallback
-        // with warning to LocalProcessBackend (so darwin and non-container
-        // builds still work, but log that isolation is not enforced).
-        #[cfg(feature = "container")]
-        {
-            return self.execute_via_watchdog(req).await;
-        }
-        #[cfg(not(feature = "container"))]
-        {
-            tracing::warn!(
-                "container feature not enabled, falling back to LocalProcessBackend (no isolation)"
-            );
-            return self.fallback.execute(req).await;
-        }
-    }
-}
-
-#[cfg(feature = "container")]
-impl ContainerBackend {
-    async fn execute_via_watchdog(&self, req: ExecRequest) -> anyhow::Result<ExecOutput> {
-        // This is the real wiring to watchdog crate. The exact types depend on
-        // the watchdog version; we map our ExecRequest -> watchdog::ExecRequest
-        // and ExecOutput -> our ExecOutput. If watchdog API changes, this is the
-        // single place to update.
-        //
-        // For now, we construct a watchdog Pool per-request (in production, pool
-        // would be shared per workspace). This keeps the implementation simple
-        // and avoids global state while still validating the wiring.
-        use watchdog::{Config, Limits as WdLimits, Pool};
-
-        let limits = WdLimits {
-            memory_bytes: req.limits.memory_bytes.or(Some(128 << 20)),
-            pids_max: Some(64),
-            cpu_time: req.limits.cpu_time,
-        };
-
-        let config = Config {
-            kernel: self
-                .kernel
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("vmlinux")),
-            rootfs: self
-                .rootfs
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("alpine.ext4")),
-            vsock: self
-                .vsock
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/tmp/firecracker.sock")),
-            cgroup: limits,
-            seccomp: true,
-        };
-
-        // Pool is cheap to create for the stub; real watchdog would cache.
-        let pool = Pool::new(config).map_err(|e| anyhow::anyhow!("watchdog pool: {e}"))?;
-
-        // Map our ExecRequest to watchdog's type. Watchdog is expected to have
-        // a compatible ExecRequest; if not, we adapt here.
-        let wd_req = watchdog::ExecRequest {
-            program: req.program.clone(),
-            args: req.args.clone(),
-            working_dir: req.working_dir.clone(),
-            env: req.env.clone(),
-            stdin: req.stdin.clone(),
-            limits: watchdog::ResourceLimits {
-                timeout: req.limits.timeout,
-                output_limit: req.limits.output_limit,
-                cpu_time: req.limits.cpu_time,
-                memory_bytes: req.limits.memory_bytes,
-            },
-        };
-
-        let wd_out = pool
-            .exec(wd_req)
-            .await
-            .map_err(|e| anyhow::anyhow!("watchdog exec: {e}"))?;
-
-        Ok(ExecOutput {
-            exit_code: wd_out.exit_code,
-            stdout: wd_out.stdout,
-            stderr: wd_out.stderr,
-            stdout_truncated: wd_out.stdout_truncated,
-            stderr_truncated: wd_out.stderr_truncated,
-            timed_out: wd_out.timed_out,
-        })
     }
 }
 
@@ -838,6 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "wasm"))]
     async fn wasm_backend_without_feature_is_unsupported() {
         let backend = WasmBackend::default();
         let err = backend
@@ -855,19 +836,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn container_backend_falls_back_on_macos() {
-        // On macOS / no KVM, ContainerBackend should fallback to LocalProcessBackend
-        let backend = ContainerBackend::default();
-        // is_kvm_available should be false on macOS
-        if ContainerBackend::is_kvm_available() {
-            return;
-        }
+    async fn container_backend_refuses_rather_than_falling_back() {
+        // MAR-P0-002: requesting the container backend must never silently
+        // run the workload locally. It refuses on every platform — including
+        // Linux with KVM, where there is still no runtime wired.
+        let backend = ContainerBackend::new("alpine:3.19")
+            .with_kernel("/tmp/vmlinux")
+            .with_rootfs("/tmp/alpine.ext4");
+        assert_eq!(backend.image.as_deref(), Some("alpine:3.19"));
+        assert_eq!(
+            backend.kernel.as_deref(),
+            Some(std::path::Path::new("/tmp/vmlinux"))
+        );
+        assert_eq!(backend.name(), "container");
         let echo = if std::path::Path::new("/bin/echo").exists() {
             "/bin/echo"
         } else {
             "/usr/bin/echo"
         };
-        let out = backend
+        let err = backend
             .execute(ExecRequest {
                 program: echo.into(),
                 args: vec!["hello".into()],
@@ -881,45 +868,36 @@ mod tests {
                 },
             })
             .await
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
-        assert!(!out.timed_out);
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("isolation_unavailable"),
+            "container backend did not fail closed: {err}"
+        );
     }
 
     #[tokio::test]
-    async fn container_backend_resource_limits_mapped() {
-        let backend = ContainerBackend::new("alpine:3.19")
-            .with_kernel("/tmp/vmlinux")
-            .with_rootfs("/tmp/alpine.ext4");
-        assert_eq!(backend.image.as_deref(), Some("alpine:3.19"));
-        assert_eq!(
-            backend.kernel.as_deref(),
-            Some(std::path::Path::new("/tmp/vmlinux"))
-        );
-        // On macOS, it will still fallback but should not panic on ResourceLimits
+    async fn shell_tool_on_the_container_backend_reports_unavailable() {
+        // End to end through `ShellTool`: no process spawns, and the caller
+        // learns the backend — not a tool failure — is unavailable.
+        use crate::shell::AllowedCommand;
+        use crate::{ArgumentPolicy, ShellTool, Tool};
         let echo = if std::path::Path::new("/bin/echo").exists() {
             "/bin/echo"
         } else {
             "/usr/bin/echo"
         };
-        let out = backend
-            .execute(ExecRequest {
-                program: echo.into(),
-                args: vec!["test".into()],
-                working_dir: None,
-                env: HashMap::new(),
-                stdin: None,
-                limits: ResourceLimits {
-                    timeout: Duration::from_secs(1),
-                    output_limit: 1024,
-                    cpu_time: Some(Duration::from_secs(1)),
-                    memory_bytes: Some(64 * 1024 * 1024),
-                },
-            })
+        let tool = ShellTool::new(vec![
+            AllowedCommand::new(echo).with_arguments(ArgumentPolicy::NoFlags)
+        ])
+        .with_backend(std::sync::Arc::new(ContainerBackend::default()));
+        let err = tool
+            .execute(serde_json::json!({"program": echo, "args": ["hi"]}))
             .await
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0));
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("isolation_unavailable"),
+            "shell did not surface the backend refusal: {err}"
+        );
     }
 
     #[tokio::test]
@@ -934,12 +912,16 @@ mod tests {
             (func $_start (export "_start")
                 (i32.store (i32.const 0) (i32.const 8))
                 (i32.store (i32.const 4) (i32.const 11))
-                (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 20) drop)
+                (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 20)))
                 (call $proc_exit (i32.const 0))
             )
         )"#;
         let wasm = wat::parse_str(wat).unwrap();
-        let tmp = std::env::temp_dir().join(format!("wasm_hello_{}.wasm", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "wasm_hello_{}_{}.wasm",
+            std::process::id(),
+            uuid_simple()
+        ));
         std::fs::write(&tmp, &wasm).unwrap();
         let backend = WasmBackend {
             fuel: Some(1_000_000),
@@ -964,5 +946,175 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(String::from_utf8_lossy(&out.stdout).contains("hello wasm"));
         assert!(!out.timed_out);
+    }
+
+    #[cfg(feature = "wasm")]
+    fn uuid_simple() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Write `wat` to a unique temp file and return its path. The caller
+    /// removes the file; a leak on panic is acceptable in tests.
+    #[cfg(feature = "wasm")]
+    fn write_wasm_module(name: &str, wat: &str) -> std::path::PathBuf {
+        let wasm = wat::parse_str(wat).unwrap();
+        let tmp = std::env::temp_dir().join(format!("wasm_{name}_{}.wasm", uuid_simple()));
+        std::fs::write(&tmp, &wasm).unwrap();
+        tmp
+    }
+
+    #[cfg(feature = "wasm")]
+    fn wasm_request(program: std::path::PathBuf, timeout: Duration) -> ExecRequest {
+        ExecRequest {
+            program,
+            args: vec![],
+            working_dir: None,
+            env: HashMap::new(),
+            stdin: None,
+            limits: ResourceLimits {
+                timeout,
+                output_limit: 1024 * 1024,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_fuel_exhaustion_is_reported_as_timeout() {
+        // An infinite loop with almost no fuel must trap on fuel, which the
+        // backend reports as a timeout (killed by limits, no exit code).
+        let wat = r#"(module
+            (func $_start (export "_start")
+                (loop $spin (br $spin))
+            )
+        )"#;
+        let tmp = write_wasm_module("fuel", wat);
+        let backend = WasmBackend {
+            fuel: Some(100),
+            memory_limit: Some(16 * 1024 * 1024),
+        };
+        let out = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(out.timed_out, "fuel exhaustion was not reported: {out:?}");
+        assert_eq!(out.exit_code, None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_wall_clock_timeout_fires_without_fuel() {
+        // Generous fuel but a short wall-clock deadline: the epoch
+        // interruption must still stop the module and report a timeout.
+        let wat = r#"(module
+            (func $_start (export "_start")
+                (loop $spin (br $spin))
+            )
+        )"#;
+        let tmp = write_wasm_module("epoch", wat);
+        let backend = WasmBackend {
+            fuel: None,
+            memory_limit: Some(16 * 1024 * 1024),
+        };
+        let out = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_millis(300)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(out.timed_out, "epoch timeout was not reported: {out:?}");
+        assert_eq!(out.exit_code, None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_memory_limit_is_enforced() {
+        // One page of memory, then a grow far past the 64 KiB limit. A
+        // refused grow returns -1 rather than trapping, so the module turns
+        // that into an `unreachable` trap — the point is the grow must not
+        // succeed and `_start` must not exit 0.
+        let wat = r#"(module
+            (memory 1)
+            (export "memory" (memory 0))
+            (func $_start (export "_start")
+                (if (i32.eq (memory.grow (i32.const 100)) (i32.const -1))
+                    (then (unreachable))
+                )
+            )
+        )"#;
+        let tmp = write_wasm_module("memory", wat);
+        let backend = WasmBackend {
+            fuel: Some(1_000_000),
+            memory_limit: Some(64 * 1024),
+        };
+        let out = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_ne!(
+            out.exit_code,
+            Some(0),
+            "memory growth past the limit succeeded: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_module_without_an_entry_point_is_a_structured_error() {
+        let wat = r#"(module (memory 1) (export "memory" (memory 0)))"#;
+        let tmp = write_wasm_module("noentry", wat);
+        let backend = WasmBackend::default();
+        let err = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            err.to_string().contains("no _start"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_guest_has_no_filesystem_imports() {
+        // The backend exposes only `fd_write` and `proc_exit`: a module
+        // importing anything else (here `path_open`) must fail to link.
+        // That is the whole filesystem preopen story — there is nothing to
+        // preopen because no filesystem interface exists.
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "path_open"
+                (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+            (memory 1)
+            (export "memory" (memory 0))
+            (func $_start (export "_start")
+                (drop (call $path_open
+                    (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+                    (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
+            )
+        )"#;
+        let tmp = write_wasm_module("nofs", wat);
+        let backend = WasmBackend::default();
+        let err = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&tmp);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path_open") || msg.contains("unknown import"),
+            "filesystem import was not refused at link time: {msg}"
+        );
     }
 }

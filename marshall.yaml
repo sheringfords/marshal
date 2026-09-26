@@ -1,10 +1,16 @@
-# marshall.yaml — Policy as Code (Phase 3)
-# Validate: cargo run --bin marshalld -- --config ./marshall.yaml --help
-# Hot reload: marshalld watches this file via `notify` and swaps registry atomically.
+# marshall.yaml — Policy as Code
+#
+# Validate without starting the server:
+#   cargo run --bin marshalld -- --validate-config ./marshall.yaml
+#
+# Hot reload: marshalld watches this file via `notify` and swaps the registry
+# atomically. Every allowlist below is deny-by-default: an empty list means the
+# tool is not registered at all, not that everything is permitted.
 
 workspace: /tmp/marshalld
 concurrency: 32
-audit_log: ./audit.jsonl
+# Written by the daemon; keep it out of the repo.
+audit_log: /tmp/marshalld/audit.jsonl
 
 filesystem:
   writable: true
@@ -14,6 +20,7 @@ shell:
   timeout_ms: 10000
   output_limit: 1048576
   # allowed_env: [PATH, TZ]  # if set, only these inherited; otherwise env_clear
+  # An empty `commands` list means the shell tool is not registered.
   commands:
     - program: /bin/echo
       args: NoFlags
@@ -30,9 +37,30 @@ http:
   timeout_ms: 30000
 
 code:
-  allowed_languages: [python, bash, javascript]
+  # Disabled by default, and deliberately so.
+  #
+  # On the local backend the `code` tool runs arbitrary source as a child of the
+  # daemon with no OS isolation. A snippet can read any file the daemon can read
+  # and reach any host the daemon can reach — the `filesystem` and `http`
+  # policies above do not apply to it. Enabling a language therefore also
+  # requires `allow_unsandboxed: true`, and the config will not load without it.
+  #
+  #   allowed_languages: [python, bash, javascript]
+  #   allow_unsandboxed: true
+  #
+  # For untrusted input, run marshalld under the `wasm` or `container` backend
+  # instead of setting this.
+  allowed_languages: []
   timeout_ms: 10000
   output_limit: 1048576
+
+# Per-client quota. `concurrency` above caps total in-flight work, which
+# protects the host; this stops one caller consuming everyone else's share.
+# Clients are told apart by bearer token, or by peer address when there is none.
+rate_limit:
+  enabled: true
+  per_minute: 600   # 10/s sustained
+  burst: 60
 
 system:
   allowed_env: [PATH, TZ]

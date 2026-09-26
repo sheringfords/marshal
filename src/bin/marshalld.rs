@@ -1,1226 +1,42 @@
-//! marshalld — hosted executor service (Phase 2)
+//! `marshalld` — CLI wrapper over [`marshall::server`].
+//!
+//! Everything interesting lives in the library so it can be tested without a
+//! socket. This file parses arguments, sets up tracing, and hands off to
+//! [`marshall::server::serve`].
 //!
 //! ```sh
-//! cargo run --bin marshalld -- --port 3000 --workspace /tmp/work
-//! curl http://localhost:3000/health
-//! curl http://localhost:3000/v1/tools
-//! curl -X POST http://localhost:3000/v1/execute \
-//!   -H 'content-type: application/json' \
-//!   -d '{"tool":"filesystem","args":{"operation":"list","path":"/tmp/work"}}'
+//! marshalld --config marshall.yaml --port 3000
+//! marshalld --validate-config ./marshall.yaml
 //! ```
-//!
-//! Design mirrors `executor.sh`: session = isolated `Sandbox` on `tmpfs` (here
-//! `std::env::temp_dir()/marshalld/<uuid>`), pooled via `concurrency_limit`
-//! + token bucket quotas.
-//!
-//! Phase 2 uses `LocalProcessBackend`; Phase 3 swaps to `WasmBackend`/`ContainerBackend`.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use axum::{
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::{sse::Event, IntoResponse, Response, Sse},
-    routing::{get, post},
-    Json, Router,
-};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn};
-
-use marshall::{
-    destination as dest, shell::AllowedCommand, ArgumentPolicy, EgressPolicy, ExecutionPolicy,
-    FileSystemTool, HttpTool, Limits, Sandbox, ShellTool, ToolOutcome, ToolRegistry,
-};
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct AppState {
-    registry: Arc<tokio::sync::RwLock<Arc<ToolRegistry>>>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
-    /// Concurrency cap (pool). `executor.sh` default ~32 per node.
-    semaphore: Arc<Semaphore>,
-    /// Audit log path (JSONL). If None, logs to tracing only.
-    audit_path: Option<PathBuf>,
-    /// workspace root for new sessions (tmpfs on Linux).
-    workspace_root: PathBuf,
-    metrics: Arc<Metrics>,
-    audit_lock: Arc<Mutex<()>>,
-    /// Egress allowlist from ExecutionPolicy (host file) — server-side enforcement.
-    egress_hosts: Arc<Mutex<Vec<String>>>,
-    /// Optional bearer token (`MARSHALLD_API_TOKEN`). If set, `/v1/*`
-    /// requires `Authorization: Bearer <token>`.
-    auth_token: Option<String>,
-    /// Session TTL (`MARSHALLD_SESSION_TTL_SECS`, default 3600s).
-    session_ttl: Duration,
-}
-
-/// Default session TTL: 1h.
-fn session_ttl_from_env() -> Duration {
-    std::env::var("MARSHALLD_SESSION_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(3600))
-}
-
-fn auth_token_from_env() -> Option<String> {
-    std::env::var("MARSHALLD_API_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// 401 response when the bearer token is missing/wrong. `None` = authorized.
-fn check_auth(headers: &axum::http::HeaderMap, state: &AppState) -> Option<Response> {
-    let expected = match &state.auth_token {
-        Some(t) => t,
-        None => return None,
-    };
-    let got = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    // Constant-shape comparison to avoid leaking prefix length via timing.
-    let ok = got.strip_prefix("Bearer ").is_some_and(|tok| {
-        tok.len() == expected.len()
-            && tok
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
-    });
-    if ok {
-        None
-    } else {
-        Some(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "unauthorized".into(),
-                    code: "unauthorized".into(),
-                }),
-            )
-                .into_response(),
-        )
-    }
-}
-
-#[derive(Debug)]
-struct Metrics {
-    requests_total: std::sync::atomic::AtomicU64,
-    success_total: std::sync::atomic::AtomicU64,
-    failure_total: std::sync::atomic::AtomicU64,
-    duration_ms_sum: std::sync::atomic::AtomicU64,
-    // Histogram buckets: 10, 50, 100, 500, 1000, 5000, +Inf ms
-    buckets: [std::sync::atomic::AtomicU64; 7],
-    per_tool: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>, // tool -> (success, failure)
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self {
-            requests_total: std::sync::atomic::AtomicU64::new(0),
-            success_total: std::sync::atomic::AtomicU64::new(0),
-            failure_total: std::sync::atomic::AtomicU64::new(0),
-            duration_ms_sum: std::sync::atomic::AtomicU64::new(0),
-            buckets: [0, 0, 0, 0, 0, 0, 0].map(|_| std::sync::atomic::AtomicU64::new(0)),
-            per_tool: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl Metrics {
-    fn inc_request(&self) {
-        self.requests_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    #[allow(dead_code)]
-    fn observe(&self, success: bool, duration_ms: u64) {
-        self.observe_with_tool("", success, duration_ms);
-    }
-    fn observe_with_tool(&self, tool: &str, success: bool, duration_ms: u64) {
-        if success {
-            self.success_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.failure_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.duration_ms_sum
-            .fetch_add(duration_ms, std::sync::atomic::Ordering::Relaxed);
-        let idx = match duration_ms {
-            0..=10 => 0,
-            11..=50 => 1,
-            51..=100 => 2,
-            101..=500 => 3,
-            501..=1000 => 4,
-            1001..=5000 => 5,
-            _ => 6,
-        };
-        self.buckets[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !tool.is_empty() {
-            if let Ok(mut map) = self.per_tool.lock() {
-                let entry = map.entry(tool.to_string()).or_insert((0, 0));
-                if success {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
-                }
-            }
-        }
-    }
-    fn exposition(&self) -> String {
-        let r = self
-            .requests_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let s = self
-            .success_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let f = self
-            .failure_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let d = self
-            .duration_ms_sum
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let b: Vec<u64> = self
-            .buckets
-            .iter()
-            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-            .collect();
-        // Prometheus histogram buckets must be cumulative.
-        let mut cum = 0u64;
-        let mut cb = Vec::with_capacity(7);
-        for &v in &b {
-            cum += v;
-            cb.push(cum);
-        }
-        let mut out = format!(
-            "# HELP marshalld_requests_total Total execute requests\n# TYPE marshalld_requests_total counter\nmarshalld_requests_total {r}\n# HELP marshalld_success_total Successful tool outcomes\n# TYPE marshalld_success_total counter\nmarshalld_success_total {s}\n# HELP marshalld_failure_total Failed tool outcomes\n# TYPE marshalld_failure_total counter\nmarshalld_failure_total {f}\n# HELP marshalld_duration_ms_sum Sum of durations ms\n# TYPE marshalld_duration_ms_sum counter\nmarshalld_duration_ms_sum {d}\n# HELP marshalld_duration_ms_bucket Histogram\n# TYPE marshalld_duration_ms_bucket histogram\nmarshalld_duration_ms_bucket{{le=\"10\"}} {}\nmarshalld_duration_ms_bucket{{le=\"50\"}} {}\nmarshalld_duration_ms_bucket{{le=\"100\"}} {}\nmarshalld_duration_ms_bucket{{le=\"500\"}} {}\nmarshalld_duration_ms_bucket{{le=\"1000\"}} {}\nmarshalld_duration_ms_bucket{{le=\"5000\"}} {}\nmarshalld_duration_ms_bucket{{le=\"+Inf\"}} {}\nmarshalld_duration_ms_count {r}\nmarshalld_duration_ms_sum {d}\n",
-            cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6]
-        );
-        if let Ok(map) = self.per_tool.lock() {
-            if !map.is_empty() {
-                out.push_str("# HELP marshalld_tool_requests_total Per-tool requests\n# TYPE marshalld_tool_requests_total counter\n");
-                for (tool, (succ, fail)) in map.iter() {
-                    out.push_str(&format!("marshalld_tool_requests_total{{tool=\"{tool}\",status=\"success\"}} {succ}\n"));
-                    out.push_str(&format!("marshalld_tool_requests_total{{tool=\"{tool}\",status=\"failure\"}} {fail}\n"));
-                }
-            }
-        }
-        out
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct Session {
-    id: String,
-    sandbox: Sandbox,
-    root: PathBuf,
-    created: Instant,
-}
-
-impl Session {
-    fn is_expired(&self, ttl: Duration) -> bool {
-        self.created.elapsed() > ttl
-    }
-}
-
-/// Remove expired sessions + their workspace dirs. Returns count removed.
-async fn purge_expired_sessions(state: &AppState) -> usize {
-    let ttl = state.session_ttl;
-    let mut sessions = state.sessions.lock().await;
-    let expired: Vec<(String, PathBuf)> = sessions
-        .iter()
-        .filter(|(_, s)| s.is_expired(ttl))
-        .map(|(id, s)| (id.clone(), s.root.clone()))
-        .collect();
-    let n = expired.len();
-    for (id, root) in expired {
-        sessions.remove(&id);
-        let _ = std::fs::remove_dir_all(&root);
-        info!(session_id = %id, "session expired");
-    }
-    n
-}
-
-fn spawn_session_sweeper(state: AppState) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            purge_expired_sessions(&state).await;
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Request/Response types
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct ExecuteRequest {
-    tool: String,
-    args: serde_json::Value,
-    /// Optional session id — if omitted, uses default workspace sandbox.
-    session_id: Option<String>,
-    /// Idempotency key for `execute_once`.
-    idempotency_key: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ExecuteResponse {
-    outcome: ToolOutcome,
-}
-
-#[derive(Deserialize)]
-struct BatchRequest {
-    requests: Vec<ExecuteRequest>,
-    max_concurrency: Option<usize>,
-    /// Optional session to scope all steps (validates paths inside session root)
-    session_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct BatchResponse {
-    outcomes: Vec<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct SequenceRequest {
-    steps: Vec<ExecuteRequest>,
-    continue_on_error: Option<bool>,
-    /// Optional session to scope all steps
-    session_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SequenceResponse {
-    outcomes: Vec<serde_json::Value>,
-    executed: usize,
-    total: usize,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct CreateSessionRequest {
-    /// Optional label for audit.
-    label: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CreateSessionResponse {
-    session_id: String,
-    root: String,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
-    tools: Vec<String>,
-    sessions: usize,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-    code: String,
-}
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
-
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await.len();
-    let registry = state.registry.read().await.clone();
-    Json(HealthResponse {
-        status: "ok".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        tools: registry.tool_names(),
-        sessions,
-    })
-}
-
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        state.metrics.exposition(),
-    )
-}
-
-#[tracing::instrument(skip(state))]
-async fn list_tools(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    let registry = state.registry.read().await.clone();
-    Json(registry.definitions()).into_response()
-}
-
-async fn create_session(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(_req): Json<CreateSessionRequest>,
-) -> impl IntoResponse {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let root = state.workspace_root.join(&id);
-    if let Err(e) = std::fs::create_dir_all(&root) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-    let sandbox = match Sandbox::new([&root]) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-    let session = Session {
-        id: id.clone(),
-        sandbox: sandbox.clone(),
-        root: root.clone(),
-        created: Instant::now(),
-    };
-
-    // Register per-session filesystem tool dynamically? For P2 we keep global
-    // registry + validate session root manually. Full per-session registry is
-    // Phase 3 (requires registry interior mutability). For now we just track
-    // session and let callers pass absolute path inside session root.
-
-    state.sessions.lock().await.insert(id.clone(), session);
-
-    info!(session_id = %id, root = %root.display(), "session created");
-
-    (
-        StatusCode::CREATED,
-        Json(CreateSessionResponse {
-            session_id: id,
-            root: root.display().to_string(),
-        }),
-    )
-        .into_response()
-}
-
-fn redacted_url(url: &str) -> String {
-    dest::host_of(url).unwrap_or_else(|_| "invalid".into())
-}
-
-async fn egress_allowed_hosts(state: &AppState) -> Vec<String> {
-    let policy_hosts = state.egress_hosts.lock().await.clone();
-    if !policy_hosts.is_empty() {
-        return policy_hosts;
-    }
-    std::env::var("MARSHALLD_ALLOWED_HOSTS")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .collect()
-}
-
-fn check_session_path(sess: &Session, args: &serde_json::Value) -> Option<Response> {
-    for key in ["path", "destination"] {
-        if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
-            let path = Path::new(p);
-            // Must be inside session root (absolute check). Relative paths are also denied to enforce session isolation.
-            if !path.starts_with(&sess.root) {
-                // Allow also normalized path that equals root
-                if path != sess.root.as_path() {
-                    return Some(
-                        (
-                            StatusCode::FORBIDDEN,
-                            Json(ErrorResponse {
-                                error: "path_not_allowed: outside session".into(),
-                                code: "path_not_allowed".into(),
-                            }),
-                        )
-                            .into_response(),
-                    );
-                }
-            }
-        }
-    }
-    None
-}
-
-fn inject_session_id(requests: &mut [ExecuteRequest], top_sid: &Option<String>) {
-    for r in requests.iter_mut() {
-        // Per-step session_id takes precedence; fall back to top-level.
-        let sid = r.session_id.as_ref().or(top_sid.as_ref());
-        if let Some(sid) = sid {
-            if matches!(r.tool.as_str(), "memory" | "todo" | "plan")
-                && r.args.get("session_id").is_none()
-            {
-                if let Some(obj) = r.args.as_object_mut() {
-                    obj.insert(
-                        "session_id".to_string(),
-                        serde_json::Value::String(sid.clone()),
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[tracing::instrument(skip(state, req), fields(tool = %req.tool))]
-async fn execute(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<ExecuteRequest>,
-) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    state.metrics.inc_request();
-    // Concurrency guard — 503 if at cap (pool).
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Session validation: if session_id given, ensure it exists and paths are inside it.
-    if let Some(sid) = &req.session_id {
-        // Opportunistically drop expired sessions before lookup.
-        purge_expired_sessions(&state).await;
-        let sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get(sid) {
-            if sess.is_expired(state.session_ttl) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("session expired: {sid}"),
-                        code: "session_expired".into(),
-                    }),
-                )
-                    .into_response();
-            }
-            if let Some(resp) = check_session_path(sess, &req.args) {
-                return resp;
-            }
-        } else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("session not found: {sid}"),
-                    code: "session_not_found".into(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    // Egress proxy — server-side SSRF enforcement (Phase 3 defense-in-depth).
-    if req.tool == "http" {
-        if let Some(url) = req.args.get("url").and_then(|v| v.as_str()) {
-            // Always validate destination (blocks 169.254.169.254, private ranges etc.)
-            if let Err(e) = dest::validate_destination(url) {
-                warn!(error = %e, url = %redacted_url(url), "egress blocked (destination)");
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            // If allowlist configured via policy file or env, enforce it server-side (not just HttpTool).
-            let allowed = egress_allowed_hosts(&state).await;
-            if !allowed.is_empty() {
-                let egress = EgressPolicy::new(allowed);
-                if let Err(err) = egress.check(url) {
-                    warn!(error = %err.code, url = %err.url_redacted, "egress blocked (allowlist)");
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            error: err.code.clone(),
-                            code: err.code,
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
-    let started = Instant::now();
-    let registry = state.registry.read().await.clone();
-    let outcome = if let Some(key) = req.idempotency_key {
-        match registry.execute_once(&key, &req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, tool = %req.tool, "execute_once rejected");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: extract_code(&e.to_string()),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        match registry.execute(&req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, tool = %req.tool, "execute rejected");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: extract_code(&e.to_string()),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    // Audit: JSONL with sha256 (P0 redaction intact).
-    audit_log(&state, &outcome, started.elapsed().as_millis() as u64).await;
-
-    // Metrics + OTel
-    state
-        .metrics
-        .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
-    info!(
-        tool = %outcome.tool,
-        success = outcome.success,
-        duration_ms = outcome.duration_ms,
-        error_code = ?outcome.error_code,
-        "tool executed via http"
-    );
-
-    (StatusCode::OK, Json(ExecuteResponse { outcome })).into_response()
-}
-
-async fn execute_batch(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(mut req): Json<BatchRequest>,
-) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    purge_expired_sessions(&state).await;
-    // Auto-scope agentic state to top-level session
-    inject_session_id(&mut req.requests, &req.session_id);
-    // Admission control: limit batch size and concurrency to avoid OOM / fan-out.
-    const MAX_BATCH: usize = 64;
-    if req.requests.len() > MAX_BATCH {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("batch too large: {} > {MAX_BATCH}", req.requests.len()),
-                code: "batch_too_large".into(),
-            }),
-        )
-            .into_response();
-    }
-    // Acquire permits proportional to concurrency to avoid fan-out bypassing global limit.
-    let max = req.max_concurrency.unwrap_or(8).clamp(1, 32);
-    // Try to acquire `max` permits or fail fast; simpler to acquire 1 global permit and rely on inner sem.
-    // To avoid 32x blow-up, we acquire 1 but bound max to 32 and batch size to 64.
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    // Session validation (top-level + per-step)
-    let top_sid = req.session_id.clone();
-    {
-        let sessions = state.sessions.lock().await;
-        if let Some(sid) = &top_sid {
-            if !sessions.contains_key(sid) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("session not found: {sid}"),
-                        code: "session_not_found".into(),
-                    }),
-                )
-                    .into_response();
-            }
-            if let Some(sess) = sessions.get(sid) {
-                for r in &req.requests {
-                    if let Some(resp) = check_session_path(sess, &r.args) {
-                        return resp;
-                    }
-                    if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                        if r.tool == "http" {
-                            if let Err(e) = dest::validate_destination(url) {
-                                return (
-                                    StatusCode::FORBIDDEN,
-                                    Json(ErrorResponse {
-                                        error: e.to_string(),
-                                        code: e.to_string(),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                            let allowed = egress_allowed_hosts(&state).await;
-                            if !allowed.is_empty() {
-                                let egress = EgressPolicy::new(allowed);
-                                if let Err(err) = egress.check(url) {
-                                    return (
-                                        StatusCode::FORBIDDEN,
-                                        Json(ErrorResponse {
-                                            error: err.code.clone(),
-                                            code: err.code,
-                                        }),
-                                    )
-                                        .into_response();
-                                }
-                            }
-                        }
-                    }
-                    // Per-step session override validation
-                    if let Some(psid) = &r.session_id {
-                        if !sessions.contains_key(psid) {
-                            return (
-                                StatusCode::NOT_FOUND,
-                                Json(ErrorResponse {
-                                    error: format!("session not found: {psid}"),
-                                    code: "session_not_found".into(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        if let Some(psess) = sessions.get(psid) {
-                            if let Some(resp) = check_session_path(psess, &r.args) {
-                                return resp;
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // No top-level session, still validate per-step sessions
-            for r in &req.requests {
-                if let Some(psid) = &r.session_id {
-                    if !sessions.contains_key(psid) {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("session not found: {psid}"),
-                                code: "session_not_found".into(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-                if r.tool == "http" {
-                    if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                        if let Err(e) = dest::validate_destination(url) {
-                            return (
-                                StatusCode::FORBIDDEN,
-                                Json(ErrorResponse {
-                                    error: e.to_string(),
-                                    code: e.to_string(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        let allowed = egress_allowed_hosts(&state).await;
-                        if !allowed.is_empty() {
-                            let egress = EgressPolicy::new(allowed);
-                            if let Err(err) = egress.check(url) {
-                                return (
-                                    StatusCode::FORBIDDEN,
-                                    Json(ErrorResponse {
-                                        error: err.code.clone(),
-                                        code: err.code,
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let inner: Vec<(String, serde_json::Value)> =
-        req.requests.into_iter().map(|r| (r.tool, r.args)).collect();
-    state.metrics.inc_request();
-    let registry = state.registry.read().await.clone();
-    let results = registry.execute_batch(inner, max).await;
-    let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
-    for r in results {
-        match r {
-            Ok(o) => {
-                let tool = o.tool.clone();
-                state
-                    .metrics
-                    .observe_with_tool(&tool, o.success, o.duration_ms);
-                outcomes.push(
-                    serde_json::to_value(o).unwrap_or(serde_json::json!({"error":"serialize"})),
-                );
-            }
-            Err(e) => {
-                state.metrics.observe_with_tool("", false, 0);
-                outcomes.push(serde_json::json!({"error": e.to_string(), "code": extract_code(&e.to_string())}));
-            }
-        }
-    }
-    (StatusCode::OK, Json(BatchResponse { outcomes })).into_response()
-}
-
-async fn execute_sequence(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(mut req): Json<SequenceRequest>,
-) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    purge_expired_sessions(&state).await;
-    // Auto-scope agentic state to top-level session
-    inject_session_id(&mut req.steps, &req.session_id);
-    const MAX_STEPS: usize = 32;
-    if req.steps.len() > MAX_STEPS {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("sequence too large: {} > {MAX_STEPS}", req.steps.len()),
-                code: "sequence_too_large".into(),
-            }),
-        )
-            .into_response();
-    }
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    if let Some(sid) = &req.session_id {
-        let sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get(sid) {
-            for r in &req.steps {
-                if let Some(resp) = check_session_path(sess, &r.args) {
-                    return resp;
-                }
-                if let Some(psid) = &r.session_id {
-                    if !sessions.contains_key(psid) {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("session not found: {psid}"),
-                                code: "session_not_found".into(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-        } else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("session not found: {sid}"),
-                    code: "session_not_found".into(),
-                }),
-            )
-                .into_response();
-        }
-    } else {
-        let sessions = state.sessions.lock().await;
-        for r in &req.steps {
-            if let Some(psid) = &r.session_id {
-                if !sessions.contains_key(psid) {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: format!("session not found: {psid}"),
-                            code: "session_not_found".into(),
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-    // Egress check for each step if http
-    for r in &req.steps {
-        if r.tool == "http" {
-            if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                if let Err(e) = dest::validate_destination(url) {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            error: e.to_string(),
-                            code: e.to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-                let allowed = egress_allowed_hosts(&state).await;
-                if !allowed.is_empty() {
-                    let egress = EgressPolicy::new(allowed);
-                    if let Err(err) = egress.check(url) {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(ErrorResponse {
-                                error: err.code.clone(),
-                                code: err.code,
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-        }
-    }
-    let continue_on_error = req.continue_on_error.unwrap_or(false);
-    let total = req.steps.len();
-    let inner: Vec<(String, serde_json::Value)> =
-        req.steps.into_iter().map(|r| (r.tool, r.args)).collect();
-    state.metrics.inc_request();
-    let registry = state.registry.read().await.clone();
-    let results = registry.execute_sequence(inner, continue_on_error).await;
-    let executed = results.len();
-    let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
-    for r in results {
-        match r {
-            Ok(o) => {
-                let tool = o.tool.clone();
-                state
-                    .metrics
-                    .observe_with_tool(&tool, o.success, o.duration_ms);
-                outcomes.push(
-                    serde_json::to_value(o).unwrap_or(serde_json::json!({"error":"serialize"})),
-                );
-            }
-            Err(e) => {
-                state.metrics.observe_with_tool("", false, 0);
-                outcomes.push(serde_json::json!({"error": e.to_string(), "code": extract_code(&e.to_string()), "success": false}));
-            }
-        }
-    }
-    (
-        StatusCode::OK,
-        Json(SequenceResponse {
-            outcomes,
-            executed,
-            total,
-        }),
-    )
-        .into_response()
-}
-
-/// SSE streaming — uniform SSE for all tools (shell chunks, others single outcome).
-/// Non-shell tools emit `summary` then `done` so SDKs can always parse SSE.
-async fn execute_stream(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<ExecuteRequest>,
-) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // For P2 we execute then stream buffered chunks as SSE.
-    // Real streaming will call `ShellTool::execute_streaming` directly.
-    let registry = state.registry.read().await.clone();
-    let outcome = match registry.execute(&req.tool, req.args).await {
-        Ok(o) => o,
-        Err(e) => {
-            let err_event = Event::default()
-                .event("error")
-                .data(serde_json::json!({"error": e.to_string()}).to_string());
-            let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
-            return Sse::new(stream).into_response();
-        }
-    };
-
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-
-    // Spawn chunk emission.
-    tokio::spawn(async move {
-        // Summary event.
-        let summary = Event::default()
-            .event("summary")
-            .data(serde_json::to_string(&outcome.summary).unwrap_or_default());
-        let _ = tx.send(Ok::<_, std::convert::Infallible>(summary)).await;
-
-        // Content chunks (cap 64k per SSE event to avoid large frames).
-        if let Some(content) = outcome.content {
-            for chunk in content.chunks(64 * 1024) {
-                let data = serde_json::json!({
-                    "bytes": chunk.len(),
-                    "sha256": marshall::sha256_hex(chunk),
-                    "chunk_b64": base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD, chunk
-                    ),
-                });
-                let ev = Event::default().event("chunk").data(data.to_string());
-                if tx.send(Ok(ev)).await.is_err() {
-                    break;
-                }
-            }
-        }
-
-        let done = Event::default().event("done").data(
-            serde_json::json!({
-                "success": outcome.success,
-                "error_code": outcome.error_code,
-                "duration_ms": outcome.duration_ms
-            })
-            .to_string(),
-        );
-        let _ = tx.send(Ok(done)).await;
-    });
-
-    Sse::new(ReceiverStream::new(rx)).into_response()
-}
-
-async fn delete_session(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> impl IntoResponse {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    let mut sessions = state.sessions.lock().await;
-    if let Some(sess) = sessions.remove(&id) {
-        let _ = std::fs::remove_dir_all(&sess.root);
-        info!(session_id = %id, "session deleted");
-        (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session not found: {id}"),
-                code: "session_not_found".into(),
-            }),
-        )
-            .into_response()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn extract_code(msg: &str) -> String {
-    // Policy errors are `code` strings like `path_not_allowed` — first token.
-    msg.split(':').next().unwrap_or(msg).trim().to_string()
-}
-
-async fn audit_log(state: &AppState, outcome: &ToolOutcome, _elapsed: u64) {
-    let entry = serde_json::json!({
-        "ts": chrono_like_now(),
-        "tool": outcome.tool,
-        "success": outcome.success,
-        "error_code": outcome.error_code,
-        "duration_ms": outcome.duration_ms,
-        "summary": outcome.summary,
-        "content_sha256": outcome.content.as_ref().map(|b| marshall::sha256_hex(b)),
-        "redaction_policy_version": marshall::REDACTION_POLICY_VERSION,
-    });
-    let line = serde_json::to_string(&entry).unwrap_or_default();
-    tracing::info!(audit = %line, "audit");
-
-    if let Some(path) = &state.audit_path {
-        let path = path.clone();
-        let lock = state.audit_lock.clone();
-        let _guard = lock.lock().await;
-        let line_clone = line.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            // Rotate if >10MiB: audit.jsonl -> audit.jsonl.1, serialized via audit_lock.
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() > 10 * 1024 * 1024 {
-                    let rotated = path.with_extension("jsonl.1");
-                    let _ = std::fs::rename(&path, &rotated);
-                }
-            }
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = writeln!(f, "{line_clone}");
-            }
-        })
-        .await;
-    }
-}
-
-fn chrono_like_now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-fn build_registry(workspace: &Path) -> anyhow::Result<ToolRegistry> {
-    build_registry_from_policy(&ExecutionPolicy {
-        workspace: workspace.to_path_buf(),
-        ..Default::default()
-    })
-}
-
-fn build_registry_from_policy(policy: &ExecutionPolicy) -> anyhow::Result<ToolRegistry> {
-    let sandbox = policy.sandbox()?;
-    let mut registry = ToolRegistry::new();
-
-    // Filesystem
-    let mut fs = FileSystemTool::new(sandbox.clone());
-    if policy.filesystem.writable {
-        fs = fs.writable();
-    }
-    fs = fs.with_read_limit(policy.filesystem.read_limit);
-    registry.register(std::sync::Arc::new(fs));
-
-    // Shell — from policy or fallback to echo/cat demo
-    let mut commands = policy.allowed_commands();
-    if commands.is_empty() {
-        let echo = if Path::new("/bin/echo").exists() {
-            "/bin/echo"
-        } else {
-            "/usr/bin/echo"
-        };
-        let cat = if Path::new("/bin/cat").exists() {
-            "/bin/cat"
-        } else {
-            "/usr/bin/cat"
-        };
-        commands = vec![
-            AllowedCommand::new(echo).with_arguments(ArgumentPolicy::NoFlags),
-            AllowedCommand::new(cat).with_arguments(ArgumentPolicy::NoFlags),
-        ];
-    }
-    let mut shell = ShellTool::new(commands)
-        .with_working_dirs(sandbox.clone())
-        .with_timeout(policy.shell_timeout())
-        .with_output_limit(policy.shell.output_limit);
-    if let Some(env) = &policy.shell.allowed_env {
-        shell = shell.with_allowed_env(env.clone());
-    }
-    registry.register(std::sync::Arc::new(shell));
-
-    // HTTP + egress proxy (server-side allowlist)
-    let egress = EgressPolicy::new(policy.http.allowed_hosts.clone());
-    // egress is checked again in `execute` handler for defense-in-depth
-    let http = HttpTool::new(policy.http.allowed_hosts.clone())
-        .with_timeout(policy.http_timeout())
-        .with_body_limit(policy.http.response_body_limit)
-        .with_request_body_limit(policy.http.request_body_limit);
-    let _ = egress; // kept for middleware use; HttpTool already validates
-    registry.register(std::sync::Arc::new(http));
-
-    // Agentic meta-tools — think/memory/todo/plan/reflect (no sandbox, pure planning)
-    {
-        use marshall::{MemoryTool, PlanTool, ReflectTool, ThinkTool, TodoTool};
-        registry.register(std::sync::Arc::new(ThinkTool));
-        registry.register(std::sync::Arc::new(MemoryTool::new()));
-        registry.register(std::sync::Arc::new(TodoTool::new()));
-        registry.register(std::sync::Arc::new(PlanTool::new()));
-        registry.register(std::sync::Arc::new(ReflectTool));
-    }
-
-    // Code execution (python/javascript/bash) — like executor.sh code cells
-    {
-        use marshall::CodeTool;
-        let langs = policy.code_languages();
-        let mut code_tool = CodeTool::new()
-            .with_sandbox(sandbox.clone())
-            .with_timeout(policy.code_timeout())
-            .with_output_limit(policy.code.output_limit);
-        if langs.is_empty() {
-            code_tool = code_tool.allow_all();
-        } else {
-            for lang in langs {
-                code_tool = code_tool.allow_language(lang);
-            }
-        }
-        // Inherit env allowlist if specified for shell
-        if let Some(env) = &policy.shell.allowed_env {
-            code_tool = code_tool.with_allowed_env(env.clone());
-        }
-        registry.register(std::sync::Arc::new(code_tool));
-    }
-
-    // System facts + bounded process control (deny-by-default policy)
-    {
-        registry.register(std::sync::Arc::new(policy.system_tool()));
-    }
-
-    Ok(registry)
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Tracing (json if `MARSHALLD_JSON_LOGS=1`).
+use marshall::server::{self, ServerConfig};
+use marshall::{ExecutionPolicy, Limits};
+use tracing::info;
+
+const HELP: &str = "\
+marshalld -- policy-checked tool execution over HTTP
+
+Usage: marshalld [--port 3000] [--bind 127.0.0.1] [--workspace /tmp/marshalld]
+                 [--audit-log audit.jsonl] [--concurrency 32]
+                 [--config marshall.yaml] [--validate-config <path>]
+                 [--healthcheck]
+
+Env:
+  PORT, MARSHALLD_PORT        listen port (default 3000)
+  MARSHALLD_BIND              listen address (default 127.0.0.1)
+  MARSHALLD_API_TOKEN         bearer token for /v1/*; required for non-loopback binds
+  MARSHALLD_CORS_ORIGIN       exact allowed origin; unset means same-origin only
+  MARSHALLD_SESSION_TTL_SECS  session lifetime in seconds (default 3600)
+  MARSHALLD_ALLOWED_HOSTS     comma-separated egress allowlist
+  RUST_LOG, MARSHALLD_JSON_LOGS
+
+Policy: --config marshall.yaml is hot-reloaded via notify. Every allowlist is
+deny-by-default: an empty list means the tool is not registered.";
+
+fn init_tracing() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -1230,316 +46,162 @@ async fn main() -> anyhow::Result<()> {
     } else {
         subscriber.init();
     }
+}
 
-    let port: u16 = std::env::var("PORT")
+/// Parsed command line.
+struct Args {
+    port: Option<u16>,
+    bind: Option<String>,
+    workspace: Option<PathBuf>,
+    audit_path: Option<PathBuf>,
+    concurrency: Option<usize>,
+    config_path: Option<PathBuf>,
+}
+
+/// Either run the server, or do something and exit.
+enum Action {
+    Serve(Box<Args>),
+    /// Probe a running daemon and exit with its verdict.
+    Healthcheck(u16),
+    Exit,
+}
+
+fn parse_args() -> anyhow::Result<Action> {
+    let mut args = std::env::args().skip(1);
+    let mut parsed = Args {
+        port: None,
+        bind: None,
+        workspace: None,
+        audit_path: None,
+        concurrency: None,
+        config_path: None,
+    };
+
+    while let Some(arg) = args.next() {
+        // A flag whose value is missing is a mistake worth reporting: it used
+        // to be ignored, so `--config` with a typo'd path silently served the
+        // default policy.
+        let mut value = || {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{arg} requires a value"))
+        };
+        match arg.as_str() {
+            "--port" => parsed.port = Some(value()?.parse()?),
+            "--bind" => parsed.bind = Some(value()?),
+            "--workspace" => parsed.workspace = Some(PathBuf::from(value()?)),
+            "--audit-log" => parsed.audit_path = Some(PathBuf::from(value()?)),
+            "--concurrency" => parsed.concurrency = Some(value()?.parse()?),
+            "--config" | "-c" => parsed.config_path = Some(PathBuf::from(value()?)),
+            "--validate-config" => {
+                let path = value()?;
+                let policy = ExecutionPolicy::from_file(Path::new(&path))?;
+                println!("config valid: {path}");
+                println!("{policy:#?}");
+                return Ok(Action::Exit);
+            }
+            "--healthcheck" => return Ok(Action::Healthcheck(port_from_env())),
+            "--version" | "-V" => {
+                println!("marshalld {}", env!("CARGO_PKG_VERSION"));
+                return Ok(Action::Exit);
+            }
+            "--help" | "-h" => {
+                println!("{HELP}");
+                return Ok(Action::Exit);
+            }
+            other => anyhow::bail!("unknown argument: {other}\n\n{HELP}"),
+        }
+    }
+    Ok(Action::Serve(Box::new(parsed)))
+}
+
+/// Probe a locally running daemon's `/health`.
+///
+/// Exists so a container `HEALTHCHECK` can test the service rather than just
+/// proving the binary starts, without adding curl to the runtime image.
+async fn healthcheck(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let response = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("health probe failed: {e}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("health probe returned {}", response.status());
+    }
+    Ok(())
+}
+
+fn port_from_env() -> u16 {
+    std::env::var("PORT")
         .or_else(|_| std::env::var("MARSHALLD_PORT"))
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(3000)
+}
 
-    // CLI: `--port`, `--workspace`, `--audit-log`, `--config`
-    let mut args = std::env::args().skip(1);
-    let mut workspace = std::env::temp_dir().join("marshalld");
-    let mut audit_path: Option<PathBuf> = None;
-    let mut concurrency: usize = 32;
-    let mut config_path: Option<PathBuf> = None;
-    let mut policy = ExecutionPolicy::default();
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--port" => {
-                if let Some(p) = args.next() {
-                    if let Ok(v) = p.parse::<u16>() {
-                        std::env::set_var("PORT", v.to_string());
-                    }
-                }
-            }
-            "--workspace" => {
-                if let Some(p) = args.next() {
-                    workspace = PathBuf::from(p);
-                }
-            }
-            "--audit-log" => {
-                if let Some(p) = args.next() {
-                    audit_path = Some(PathBuf::from(p));
-                }
-            }
-            "--concurrency" => {
-                if let Some(c) = args.next() {
-                    if let Ok(v) = c.parse() {
-                        concurrency = v;
-                    }
-                }
-            }
-            "--config" | "-c" => {
-                if let Some(p) = args.next() {
-                    config_path = Some(PathBuf::from(p));
-                }
-            }
-            "--validate-config" => {
-                if let Some(p) = args.next() {
-                    let pol = ExecutionPolicy::from_file(Path::new(&p))?;
-                    println!("config valid: {}", p);
-                    println!("{:#?}", pol);
-                    return Ok(());
-                }
-            }
-            "--help" | "-h" => {
-                println!(
-                    "marshalld -- hosted executor\n\nUsage: marshalld [--port 3000] [--workspace /tmp/work] [--audit-log audit.jsonl] [--concurrency 32] [--config marshall.yaml]\n\nEnv: PORT, MARSHALLD_ALLOWED_HOSTS (comma list), RUST_LOG, MARSHALLD_JSON_LOGS\n\nPolicy: --config marshall.yaml (hot-reloaded via notify), or --validate-config <path>"
-                );
-                return Ok(());
-            }
-            _ => {}
+    let args = match parse_args()? {
+        Action::Serve(args) => *args,
+        Action::Healthcheck(port) => return healthcheck(port).await,
+        Action::Exit => return Ok(()),
+    };
+
+    // Load the policy file named on the command line, or `./marshall.yaml` if
+    // it happens to be there. A named config that fails to load is fatal — it
+    // used to fall back to defaults with a warning, which quietly served a
+    // policy nobody wrote.
+    let explicit_config = args.config_path.clone();
+    let config_path = explicit_config.clone().or_else(|| {
+        let candidate = PathBuf::from("marshall.yaml");
+        candidate.exists().then_some(candidate)
+    });
+
+    let mut policy = match &config_path {
+        Some(path) => {
+            let policy = ExecutionPolicy::from_file(path)
+                .map_err(|e| anyhow::anyhow!("failed to load policy {}: {e}", path.display()))?;
+            info!(config = %path.display(), "loaded policy");
+            policy
         }
+        None => ExecutionPolicy::default(),
+    };
+
+    // Command-line overrides win over the file.
+    if let Some(workspace) = args.workspace {
+        policy.workspace = workspace;
     }
-
-    // Load policy from --config or ./marshall.yaml if present
-    if let Some(p) = config_path.clone().or_else(|| {
-        let cand = PathBuf::from("marshall.yaml");
-        if cand.exists() {
-            Some(cand)
-        } else {
-            None
-        }
-    }) {
-        match ExecutionPolicy::from_file(&p) {
-            Ok(pol) => {
-                info!(config = %p.display(), "loaded marshall.yaml");
-                workspace = pol.workspace.clone();
-                audit_path = pol.audit_log.clone().or(audit_path);
-                concurrency = pol.concurrency;
-                policy = pol;
-            }
-            Err(e) => {
-                warn!(config = %p.display(), error = %e, "failed to load marshall.yaml, using defaults");
-            }
-        }
+    if let Some(concurrency) = args.concurrency {
+        policy.concurrency = concurrency;
     }
+    policy.validate()?;
 
-    // Re-read port after CLI override.
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(port);
-
-    // If policy already loaded, workspace etc come from it; ensure consistent
-    if config_path.is_some() || Path::new("marshall.yaml").exists() {
-        // policy already holds workspace/audit/concurrency; rebuild registry from it
-        std::fs::create_dir_all(&policy.workspace)?;
-        Limits::default().apply_rlimits();
-        let registry = Arc::new(build_registry_from_policy(&policy)?);
-        info!(
-            workspace = %policy.workspace.display(),
-            tools = ?registry.tool_names(),
-            concurrency,
-            "starting marshalld (policy)"
-        );
-        return serve(
-            registry,
-            policy.workspace,
-            policy.audit_log.or(audit_path),
-            concurrency,
-            port,
-            config_path,
-        )
-        .await;
-    }
-
-    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(&policy.workspace)?;
     Limits::default().apply_rlimits();
 
-    let registry = Arc::new(build_registry(&workspace)?);
+    let registry = Arc::new(server::build_registry_from_policy(&policy)?);
     info!(
-        workspace = %workspace.display(),
+        workspace = %policy.workspace.display(),
         tools = ?registry.tool_names(),
-        concurrency,
+        concurrency = policy.concurrency,
         "starting marshalld"
     );
 
-    let state = AppState {
-        registry: Arc::new(tokio::sync::RwLock::new(registry)),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        semaphore: Arc::new(Semaphore::new(concurrency)),
-        audit_path,
-        workspace_root: workspace,
-        metrics: Arc::new(Metrics::default()),
-        audit_lock: Arc::new(Mutex::new(())),
-        egress_hosts: Arc::new(Mutex::new(Vec::new())),
-        auth_token: auth_token_from_env(),
-        session_ttl: session_ttl_from_env(),
+    let config = ServerConfig {
+        workspace_root: policy.workspace.clone(),
+        audit_path: args.audit_path.or(policy.audit_log.clone()),
+        concurrency: policy.concurrency,
+        port: args.port.unwrap_or_else(port_from_env),
+        bind: args.bind,
+        config_path,
+        egress_hosts: policy.http.allowed_hosts.clone(),
+        auth_token: None,
+        session_ttl: None,
+        rate_limit: policy.rate_limit.limit(),
     };
-    if state.auth_token.is_none() {
-        warn!("MARSHALLD_API_TOKEN not set: /v1/* is unauthenticated (localhost only recommended)");
-    }
-    spawn_session_sweeper(state.clone());
 
-    let app = build_router(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(%addr, "listening");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
-}
-
-async fn serve(
-    registry: Arc<ToolRegistry>,
-    workspace_root: PathBuf,
-    audit_path: Option<PathBuf>,
-    concurrency: usize,
-    port: u16,
-    config_path: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    // Derive egress hosts from initial registry's policy was already via ExecutionPolicy; keep in sync
-    let initial_hosts = {
-        // Try to read from marshall.yaml if exists, else empty
-        if let Some(cfg) = config_path.clone() {
-            ExecutionPolicy::from_file(&cfg)
-                .map(|p| p.http.allowed_hosts)
-                .unwrap_or_default()
-        } else if Path::new("marshall.yaml").exists() {
-            ExecutionPolicy::from_file(Path::new("marshall.yaml"))
-                .map(|p| p.http.allowed_hosts)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    };
-    let state = AppState {
-        registry: Arc::new(tokio::sync::RwLock::new(registry)),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        semaphore: Arc::new(Semaphore::new(concurrency)),
-        audit_path: audit_path.clone(),
-        workspace_root: workspace_root.clone(),
-        metrics: Arc::new(Metrics::default()),
-        audit_lock: Arc::new(Mutex::new(())),
-        egress_hosts: Arc::new(Mutex::new(initial_hosts)),
-        auth_token: auth_token_from_env(),
-        session_ttl: session_ttl_from_env(),
-    };
-    if state.auth_token.is_none() {
-        warn!("MARSHALLD_API_TOKEN not set: /v1/* is unauthenticated (localhost only recommended)");
-    }
-    spawn_session_sweeper(state.clone());
-
-    // Hot reload: watch config file and swap registry atomically, including egress hosts.
-    if let Some(cfg) = config_path.clone() {
-        let registry_ref = state.registry.clone();
-        let hosts_ref = state.egress_hosts.clone();
-        tokio::spawn(async move {
-            use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-            let tx_clone = tx.clone();
-            let cfg_clone = cfg.clone();
-            let mut watcher: RecommendedWatcher = match RecommendedWatcher::new(
-                move |res: notify::Result<notify::Event>| {
-                    if let Ok(ev) = res {
-                        if ev.kind.is_modify() {
-                            let _ = tx_clone.blocking_send(());
-                        }
-                    }
-                },
-                NotifyConfig::default(),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    warn!(error = %e, "notify watcher failed");
-                    return;
-                }
-            };
-            let _ = watcher.watch(&cfg_clone, RecursiveMode::NonRecursive);
-            // Keep watcher alive
-            let _watcher = watcher;
-            while rx.recv().await.is_some() {
-                // Debounce
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                while rx.try_recv().is_ok() {}
-                match ExecutionPolicy::from_file(&cfg) {
-                    Ok(pol) => match build_registry_from_policy(&pol) {
-                        Ok(new_reg) => {
-                            *registry_ref.write().await = Arc::new(new_reg);
-                            *hosts_ref.lock().await = pol.http.allowed_hosts.clone();
-                            info!(config = %cfg.display(), "hot-reloaded marshall.yaml");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to rebuild registry from reloaded policy")
-                        }
-                    },
-                    Err(e) => warn!(error = %e, config = %cfg.display(), "failed to reload policy"),
-                }
-            }
-        });
-    }
-
-    let app = build_router(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(%addr, "listening (policy mode)");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-fn build_router(state: AppState) -> Router {
-    // CORS: `MARSHALLD_CORS_ORIGIN=https://app.example.com` restricts to one
-    // origin; unset keeps `AllowOrigin::any()` for local dev (logged).
-    let cors = {
-        let mut layer = tower_http::cors::CorsLayer::new().allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::DELETE,
-        ]);
-        layer = layer.allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-        ]);
-        if let Ok(origin) = std::env::var("MARSHALLD_CORS_ORIGIN") {
-            if let Ok(val) = origin.parse::<axum::http::HeaderValue>() {
-                layer.allow_origin(tower_http::cors::AllowOrigin::exact(val))
-            } else {
-                layer.allow_origin(tower_http::cors::AllowOrigin::any())
-            }
-        } else {
-            layer.allow_origin(tower_http::cors::AllowOrigin::any())
-        }
-    };
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/v1/tools", get(list_tools))
-        .route("/v1/sessions", post(create_session))
-        .route("/v1/sessions/:id", axum::routing::delete(delete_session))
-        .route("/v1/execute", post(execute))
-        .route("/v1/execute/batch", post(execute_batch))
-        .route("/v1/execute/sequence", post(execute_sequence))
-        .route("/v1/execute/stream", post(execute_stream))
-        .route("/v1/policy", get(get_policy))
-        .with_state(state)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(cors)
-}
-
-async fn get_policy(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    // Return current marshall.yaml if present, else defaults.
-    let path = PathBuf::from("marshall.yaml");
-    if path.exists() {
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            return (StatusCode::OK, s).into_response();
-        }
-    }
-    (
-        StatusCode::OK,
-        serde_yaml::to_string(&ExecutionPolicy::default()).unwrap_or_default(),
-    )
-        .into_response()
+    server::serve(registry, config).await
 }

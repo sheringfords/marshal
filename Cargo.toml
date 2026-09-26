@@ -5,10 +5,23 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Marshall — sandboxed tool execution for agents: filesystem, shell, HTTP, code, and system behind deny-by-default policies with SSRF protection."
-repository = "https://github.com/wiramahendra/marshall"
+repository = "https://github.com/rapture-fx/Marshall"
 readme = "README.md"
 keywords = ["agent", "sandbox", "ssrf", "tools", "security"]
 categories = ["development-tools", "web-programming"]
+# The validation harness is a research artifact, not part of the crate. Keeping
+# it out of the package keeps the published tarball to the library and service.
+exclude = [
+    "validation/",
+    "audit.jsonl",
+    "ROADMAP.md",
+    ".github/",
+    "fuzz/",
+]
+
+# Binaries are declared explicitly rather than auto-discovered, so the research
+# tooling can sit behind a feature instead of building for every user.
+autobins = false
 
 [lib]
 name = "marshall"
@@ -16,10 +29,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# The validation harness: an experiment recorder, trace analyzer, and the
+# runners used to produce `validation/`. It is a research artifact rather than
+# part of the product, and nothing in the library depends on it, so it is off by
+# default and out of the published API surface.
+experiment = []
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:cap-std"]
 backend-wasm = ["wasm"]
-backend-container = ["dep:watchdog"]
-container = ["backend-container"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -38,7 +54,6 @@ base64 = "0.22"
 wasmtime = { version = "22", optional = true }
 wasmtime-wasi = { version = "22", optional = true }
 cap-std = { version = "3.0", optional = true }
-watchdog = { git = "https://github.com/wiramahendra/watchdog", rev = "ae5ea2f1ca2e7a1978cfa54e9cbab4944324c243", optional = true }
 axum = { version = "0.7", features = ["json", "query"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
@@ -57,9 +72,48 @@ arbitrary = { version = "1.3", features = ["derive"] }
 wat = "1.0"
 
 [[bin]]
+name = "marshalld"
+path = "src/bin/marshalld.rs"
+
+[[bin]]
 name = "fuzz_destination"
 path = "fuzz/fuzz_destination.rs"
 
 [[bin]]
 name = "validation-analyzer"
 path = "src/bin/validation_analyzer.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "baseline_runner"
+path = "src/bin/baseline_runner.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "treatment_runner"
+path = "src/bin/treatment_runner.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "generate_reports"
+path = "src/bin/generate_reports.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "phase2_comparison"
+path = "src/bin/phase2_comparison.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "mcp_verify_change"
+path = "src/bin/mcp_verify_change.rs"
+required-features = ["experiment"]
+
+[[bin]]
+name = "mcp_bounded_sequence"
+path = "src/bin/mcp_bounded_sequence.rs"
+
+[[test]]
+name = "validation"
+path = "tests/validation.rs"
+required-features = ["experiment"]

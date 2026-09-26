@@ -35,14 +35,35 @@ jobs:
       # goes red, a sandbox boundary has come back open.
       - run: cargo test --test escapes
 
+      # The HTTP surface: auth, session scoping, quotas, admission control.
+      # These went unrun for a release because the suite did not exist.
+      - run: cargo test --test server
+
+      - run: cargo test --test stress
+
+      # The validation harness sits behind a feature; build and test it here so
+      # gating it does not mean never compiling it again.
+      - run: cargo test --features experiment --test validation
+      - run: cargo clippy --features experiment --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-latest'
+
       - run: cargo run --example agent_tools
 
-      - name: Install cargo-audit
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo install cargo-audit --locked || true
-      - run: cargo audit
-        if: matrix.os == 'ubuntu-latest'
-        continue-on-error: true
+      # The shipped policy must load. It is the first thing a new user runs,
+      # and it is now strict enough to reject itself if someone edits it wrong.
+      - run: cargo run --bin marshalld -- --validate-config ./marshall.yaml
+
+      # The SDKs ship auth headers and session/policy methods with no runtime
+      # dependencies of their own; stub-transport tests pin that contract.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test sdk/js/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python3 sdk/python/test_sdk_auth.py
 
   msrv:
     name: MSRV 1.88
@@ -52,6 +73,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
+      - run: cargo check --features experiment --all-targets
+
+  # The wasm isolation backend broke without anyone noticing because no job
+  # compiled it (MAR-P0-001). It builds, lints, and runs real WASI workloads
+  # here — compilation alone is not accepted as isolation evidence.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features wasm --all-targets
+      - run: cargo clippy --features wasm --all-targets -- -D warnings
+      - run: cargo test --features wasm --lib
 
   docs:
     runs-on: ubuntu-latest
@@ -62,3 +99,59 @@ jobs:
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # The published crate must build from the packaged tarball, not just from
+      # the working tree.
+      - run: cargo package --allow-dirty --no-verify
+
+  # Supply chain. This used to be `continue-on-error: true` inside the test
+  # job, so an advisory against a dependency of a security tool produced a
+  # green build.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+      - run: cargo audit --deny warnings
+      - run: cargo deny check
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: marshalld:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Refuse to serve unauthenticated on a reachable address
+        run: |
+          # The image sets MARSHALLD_BIND=0.0.0.0, so starting it without a
+          # token must fail. If this ever passes, the image ships an open
+          # executor.
+          if docker run --rm marshalld:ci --config /etc/marshalld/marshall.yaml; then
+            echo "started without MARSHALLD_API_TOKEN" >&2
+            exit 1
+          fi
+      - name: Serve and answer a health probe
+        run: |
+          docker run -d --name marshalld -p 3000:3000 \
+            -e MARSHALLD_API_TOKEN=ci-token marshalld:ci \
+            --config /etc/marshalld/marshall.yaml
+          for _ in $(seq 30); do
+            curl -fsS localhost:3000/health && break
+            sleep 1
+          done
+          curl -fsS localhost:3000/health | grep -q '"status":"ok"'
+          # /v1 must be closed without the token.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3000/v1/tools)" = 401
+          docker rm -f marshalld
