@@ -1015,3 +1015,399 @@ async fn a_configured_origin_is_echoed_and_others_are_not() {
     assert_ne!(allowed.as_deref(), Some("https://evil.example"));
     assert_ne!(allowed.as_deref(), Some("*"));
 }
+
+// ── unified admission (MAR-P0-003) ────────────────────────────
+//
+// `/v1/execute/stream` used to admit with auth + quota + concurrency only,
+// skipping session, egress, idempotency, audit, and metrics. These tests pin
+// the contract: every execution endpoint denies the same calls with the same
+// codes, and a streamed execution is audited and metered like a single one.
+
+/// POST the same body to every execution endpoint, normalizing the two
+/// envelope shapes (single/stream return the outcome; batch/sequence wrap).
+fn endpoint_bodies(
+    tool: &str,
+    args: Value,
+    session_id: Option<&str>,
+) -> Vec<(&'static str, Value)> {
+    let single = match session_id {
+        Some(sid) => json!({"tool": tool, "session_id": sid, "args": args}),
+        None => execute(tool, args.clone()),
+    };
+    vec![
+        ("/v1/execute", single),
+        (
+            "/v1/execute/batch",
+            json!({"session_id": session_id, "requests": [execute(tool, args.clone())]}),
+        ),
+        (
+            "/v1/execute/sequence",
+            json!({"session_id": session_id, "steps": [execute(tool, args.clone())]}),
+        ),
+        (
+            "/v1/execute/stream",
+            json!({"tool": tool, "session_id": session_id, "args": args}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_execution_endpoint_denies_an_unknown_session() {
+    let ws = Workspace::new("admission_unknown_session");
+    let app = ws.app();
+    let sid = "00000000-0000-0000-0000-000000000000";
+
+    for (uri, body) in endpoint_bodies(
+        "filesystem",
+        json!({"operation": "list", "path": ws.root}),
+        Some(sid),
+    ) {
+        let (status, _) = match uri {
+            "/v1/execute/stream" => {
+                let (status, text) = send_text(&app, post(uri, body)).await;
+                (status, Value::String(text))
+            }
+            _ => send(&app, post(uri, body)).await,
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri} admitted an unknown session"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_execution_endpoint_denies_an_expired_session() {
+    let ws = Workspace::new("admission_expired_session");
+    let app = ws.app_with(ServerConfig {
+        session_ttl: Some(Duration::from_millis(1)),
+        ..ws.config()
+    });
+
+    let (_, body) = send(&app, post("/v1/sessions", json!({}))).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    for (uri, body) in endpoint_bodies(
+        "filesystem",
+        json!({"operation": "list", "path": ws.root}),
+        Some(&sid),
+    ) {
+        let (status, _) = match uri {
+            "/v1/execute/stream" => {
+                let (status, text) = send_text(&app, post(uri, body)).await;
+                (status, Value::String(text))
+            }
+            _ => send(&app, post(uri, body)).await,
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri} admitted an expired session"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_denies_a_path_outside_the_session_like_execute() {
+    let ws = Workspace::new("admission_stream_scope");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+
+    let (_, body) = send(&app, post("/v1/sessions", json!({}))).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+    let args = json!({"operation": "read", "path": ws.path("shared.txt")});
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({"tool": "filesystem", "session_id": sid, "args": args}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed");
+
+    // The same call over SSE must not reach the tool either — and because it
+    // is denied at admission, there is no SSE body to parse, just a 403.
+    let (status, _) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            json!({"tool": "filesystem", "session_id": sid, "args": args}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn stream_denies_blocked_http_destinations_like_execute() {
+    let ws = Workspace::new("admission_stream_egress");
+    let app = ws.app();
+
+    for url in [
+        "https://169.254.169.254/latest/meta-data/",
+        "https://example.com/",
+    ] {
+        let args = json!({"url": url});
+        let (status, _) = send(&app, post("/v1/execute", execute("http", args.clone()))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "execute admitted {url}");
+
+        let (status, _) = send_text(&app, post("/v1/execute/stream", execute("http", args))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "stream admitted {url}");
+    }
+}
+
+#[tokio::test]
+async fn stream_is_rate_limited_and_sheds_load_like_execute() {
+    // Quota parity: an exhausted bucket refuses the stream with 429.
+    let ws = Workspace::new("admission_stream_quota");
+    let app = ws.app_with(ServerConfig {
+        rate_limit: Some(marshall::RateLimit::new(60, 2)),
+        ..ws.config()
+    });
+
+    for _ in 0..2 {
+        let (status, _) = send(&app, get("/v1/tools")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/stream",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "rate_limited");
+
+    // Concurrency parity: with the pool full, the stream sheds with 503.
+    let ws = Workspace::new("admission_stream_concurrency");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+
+    let slow = app.clone().oneshot(post(
+        "/v1/execute",
+        execute("system", json!({"operation": "sleep", "duration_ms": 400})),
+    ));
+    let contender = async {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send(
+            &app,
+            post(
+                "/v1/execute/stream",
+                execute("system", json!({"operation": "now"})),
+            ),
+        )
+        .await
+    };
+
+    let (_slow, (status, _)) = tokio::join!(slow, contender);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn a_streamed_execution_is_audited_and_metered() {
+    let ws = Workspace::new("admission_stream_observability");
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with(ServerConfig {
+        audit_path: Some(audit_path.clone()),
+        ..ws.config()
+    });
+    let echo = echo_path();
+
+    let (status, text) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            execute("shell", json!({"program": echo, "args": ["hi"]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.contains("event: summary"), "{text}");
+    assert!(text.contains("event: done"), "{text}");
+
+    for _ in 0..50 {
+        if audit_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let line = std::fs::read_to_string(&audit_path).expect("audit log");
+    let record: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(record["tool"], "shell");
+    assert_eq!(record["success"], true);
+
+    let (status, text) = send_text(&app, get("/metrics")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        text.contains(r#"marshalld_tool_requests_total{tool="shell",status="success"} 1"#),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_denied_at_admission_runs_nothing() {
+    let ws = Workspace::new("admission_stream_denied_runs_nothing");
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with(ServerConfig {
+        audit_path: Some(audit_path.clone()),
+        ..ws.config()
+    });
+
+    // Unknown session: denied before any tool runs.
+    let (status, _) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            json!({
+                "tool": "filesystem",
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "args": {"operation": "list", "path": ws.root},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // No audit record: nothing executed. No per-tool metrics either.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !audit_path.exists(),
+        "a denied stream wrote an audit record for work it never did"
+    );
+    let (_, text) = send_text(&app, get("/metrics")).await;
+    assert!(!text.contains(r#"tool="filesystem""#), "{text}");
+}
+
+#[tokio::test]
+async fn stream_honors_idempotency_like_execute() {
+    let ws = Workspace::new("admission_stream_idempotency");
+    let app = ws.app();
+    let target = ws.path("counter.txt");
+
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "idempotency_key": "stream-key",
+                "args": {"operation": "write", "path": target, "content": "first"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Same key over SSE with different content: the cached outcome replays
+    // and the file is untouched.
+    let (status, text) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            json!({
+                "tool": "filesystem",
+                "idempotency_key": "stream-key",
+                "args": {"operation": "write", "path": target, "content": "second"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.contains("event: done"), "{text}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+}
+
+#[tokio::test]
+async fn batch_and_sequence_report_per_item_failures_without_failing_the_request() {
+    let ws = Workspace::new("admission_partial_failure");
+    let app = ws.app();
+    let echo = echo_path();
+
+    // The single endpoint rejects an unknown tool with a 400 + code; the
+    // batch/sequence endpoints keep the request 200 and report per item.
+    let (status, body) = send(&app, post("/v1/execute", execute("nope", json!({})))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "tool_not_found");
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [
+                execute("shell", json!({"program": echo, "args": ["ok"]})),
+                execute("nope", json!({})),
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let outcomes = body["outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0]["success"], true);
+    assert_eq!(outcomes[1]["code"], "tool_not_found");
+
+    // A sequence stops at the failure by default and says how far it got.
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/sequence",
+            json!({"steps": [
+                execute("nope", json!({})),
+                execute("shell", json!({"program": echo, "args": ["unreached"]})),
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["executed"], 1);
+    assert_eq!(body["total"], 2);
+}
+
+#[tokio::test]
+async fn aborting_a_stream_mid_flight_does_not_wedge_the_server() {
+    let ws = Workspace::new("admission_stream_abort");
+    std::fs::write(ws.path("big.txt"), vec![b'x'; 1_000_000]).unwrap();
+    let app = ws.app();
+
+    // Start a multi-chunk stream (1 MiB of content at 64 KiB per event),
+    // then drop the client mid-flight.
+    let in_flight = tokio::spawn({
+        let app = app.clone();
+        let path = ws.path("big.txt");
+        async move {
+            let _ = app
+                .oneshot(post(
+                    "/v1/execute/stream",
+                    execute(
+                        "filesystem",
+                        json!({"operation": "read", "path": path, "include_content": true}),
+                    ),
+                ))
+                .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    in_flight.abort();
+    let _ = in_flight.await;
+
+    // The server still admits and runs work afterwards.
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcome"]["success"], true);
+}
