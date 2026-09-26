@@ -51,10 +51,11 @@ Concretely:
 - [ ] `ExecutionBackend` implementations for E2B and Firecracker-as-a-service,
       so `code` and `shell` run somewhere else and Marshall stays the thing
       that decides whether they may run at all.
-- [ ] Remove or publish `watchdog`. It is pinned to a revision of an
-      unpublished repository, so `--features container` cannot be built by
-      anyone but its author. Shipping a feature nobody else can compile is
-      worse than not shipping it.
+- [x] Remove or publish `watchdog`. Removed: the pinned revision exposes a
+      cgroup-supervisor API, not the Firecracker `Pool`/`Config` API the code
+      called, so the `container` feature never compiled; the silent local
+      fallback was a downgrade. `ContainerBackend` now fails closed with
+      `isolation_unavailable` (MAR-P0-002).
 - [ ] Retain the `openat2` descriptor for the subsequent I/O. Today it is
       resolved, converted through `/proc/self/fd`, and dropped, which leaves a
       check-then-use window that `RESOLVE_BENEATH` was meant to close.

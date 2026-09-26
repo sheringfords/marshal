@@ -196,7 +196,7 @@ Output: `summary` is intended for logs and transcripts. Header values are allowl
 
 Code: the `code` tool is the one place where enabling a tool disables the others. On the local backend a snippet runs as a child of the daemon with no OS isolation, so it reads any file the daemon can read and reaches any host the daemon can reach — `filesystem` and `http` policy do not apply to it. It is therefore off by default, and naming a language is not enough to turn it on: `code.allow_unsandboxed: true` must also be set, and the config will not load without it. For untrusted callers, use an isolating backend instead of setting it.
 
-Isolation: by default this crate enforces policy in-process. It does not apply seccomp, namespaces, or chroot. For stronger containment, run `marshalld` under the `WasmBackend` (`--features wasm`, wasmtime fuel/memory/epoch limits with a two-function WASI subset — no filesystem or network interface is exposed at all) or `ContainerBackend` (`--features container`, Firecracker via the [`watchdog`](https://github.com/wiramahendra/watchdog) crate, Linux KVM required, falls back to local execution with a warning elsewhere), or place the service itself in a container or VM. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Isolation: by default this crate enforces policy in-process. It does not apply seccomp, namespaces, or chroot. For stronger containment, run `marshalld` under the `WasmBackend` (`--features wasm`, wasmtime fuel/memory/epoch limits with a two-function WASI subset — no filesystem or network interface is exposed at all), or place the service itself in a container or VM. `ContainerBackend` exists as a fail-closed placeholder — it refuses every request with `isolation_unavailable` until a real isolation runtime is integrated — so selecting it can never silently run work without isolation. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 Service defaults: `marshalld` binds loopback and refuses a non-loopback address unless `MARSHALLD_API_TOKEN` is set — an executor reachable without credentials is a remote shell. No CORS headers are sent unless `MARSHALLD_CORS_ORIGIN` names an exact origin. Quotas are on by default, per client, keyed by a digest of the bearer token or by peer address.
 
@@ -282,7 +282,7 @@ cargo run --bin fuzz_destination -- 'https://example.com/'
 - `process_list` reads Linux `/proc` and reports `not_supported` elsewhere. `process_kill` is not scoped to session children.
 - Quotas are per client, not per tenant: every caller presenting the same token shares one bucket, because there is one token. Multi-tenancy is not implemented.
 - `code` on the local backend is not isolated. It is off by default and refuses to turn on without `allow_unsandboxed: true`, but when enabled it bypasses `filesystem` and `http` policy entirely.
-- The `watchdog` container dependency is pinned to a revision of an unpublished repository, so the `container` feature cannot be built by anyone else.
+- There is no container isolation backend: `ContainerBackend` refuses every request with `isolation_unavailable` until a real, published isolation runtime is integrated (MAR-P0-002). Do not treat selecting it as containment.
 - Path containment is check-then-use on non-Linux platforms. Linux uses `openat2` with `RESOLVE_BENEATH`; the descriptor is not retained for the subsequent I/O.
 
 ## License
