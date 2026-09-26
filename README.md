@@ -196,7 +196,7 @@ Output: `summary` is intended for logs and transcripts. Header values are allowl
 
 Code: the `code` tool is the one place where enabling a tool disables the others. On the local backend a snippet runs as a child of the daemon with no OS isolation, so it reads any file the daemon can read and reaches any host the daemon can reach — `filesystem` and `http` policy do not apply to it. It is therefore off by default, and naming a language is not enough to turn it on: `code.allow_unsandboxed: true` must also be set, and the config will not load without it. For untrusted callers, use an isolating backend instead of setting it.
 
-Isolation: by default this crate enforces policy in-process. It does not apply seccomp, namespaces, or chroot. For stronger containment, run `marshalld` under the `WasmBackend` (`--features wasm`, wasmtime fuel/memory and WASI preopen), or place the service itself in a container or VM. `ContainerBackend` exists as a fail-closed placeholder — it refuses every request with `isolation_unavailable` until a real isolation runtime is integrated — so selecting it can never silently run work without isolation. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Isolation: by default this crate enforces policy in-process. It does not apply seccomp, namespaces, or chroot. For stronger containment, run `marshalld` under the `WasmBackend` (`--features wasm`, wasmtime fuel/memory/epoch limits with a two-function WASI subset — no filesystem or network interface is exposed at all), or place the service itself in a container or VM. `ContainerBackend` exists as a fail-closed placeholder — it refuses every request with `isolation_unavailable` until a real isolation runtime is integrated — so selecting it can never silently run work without isolation. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 Service defaults: `marshalld` binds loopback and refuses a non-loopback address unless `MARSHALLD_API_TOKEN` is set — an executor reachable without credentials is a remote shell. No CORS headers are sent unless `MARSHALLD_CORS_ORIGIN` names an exact origin. Quotas are on by default, per client, keyed by a digest of the bearer token or by peer address.
 
@@ -236,19 +236,23 @@ Batch and sequence accept a top-level `session_id` and per-entry `session_id` va
 
 ```js
 import { ExecutionClient } from './index.js';
-const c = new ExecutionClient('http://localhost:3000');
+const c = new ExecutionClient('http://localhost:3000', { token: process.env.MARSHALLD_API_TOKEN });
 await c.execute('shell', { program: '/bin/echo', args: ['hi'] });
+const { session_id: SID } = await c.createSession('demo');
 await c.batch([['shell', { program: '/bin/echo', args: ['hi'] }]], { sessionId: SID });
 for await (const evt of c.stream('shell', { program: '/bin/echo', args: ['hi'] })) console.log(evt);
+await c.deleteSession(SID);
 ```
 
 ```python
 from marshall_sdk import ExecutionClient
-c = ExecutionClient("http://localhost:3000")
+c = ExecutionClient("http://localhost:3000", token="...")
 c.execute("shell", {"program": "/bin/echo", "args": ["hi"]})
+SID = c.create_session("demo")["session_id"]
 c.batch([("shell", {"program": "/bin/echo", "args": ["hi"]})], session_id=SID)
 for event, data in c.stream("shell", {"program": "/bin/echo", "args": ["hi"]}):
     print(event, data)
+c.delete_session(SID)
 ```
 
 ## Deployment

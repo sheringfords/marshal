@@ -53,6 +53,18 @@ jobs:
       # and it is now strict enough to reject itself if someone edits it wrong.
       - run: cargo run --bin marshalld -- --validate-config ./marshall.yaml
 
+      # The SDKs ship auth headers and session/policy methods with no runtime
+      # dependencies of their own; stub-transport tests pin that contract.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test sdk/js/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python3 sdk/python/test_sdk_auth.py
+
   msrv:
     name: MSRV 1.88
     runs-on: ubuntu-latest
@@ -62,6 +74,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo check --features experiment --all-targets
+
+  # The wasm isolation backend broke without anyone noticing because no job
+  # compiled it (MAR-P0-001). It builds, lints, and runs real WASI workloads
+  # here — compilation alone is not accepted as isolation evidence.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features wasm --all-targets
+      - run: cargo clippy --features wasm --all-targets -- -D warnings
+      - run: cargo test --features wasm --lib
 
   docs:
     runs-on: ubuntu-latest

@@ -32,7 +32,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
@@ -589,6 +589,188 @@ fn inject_session_id(requests: &mut [ExecuteRequest], top_sid: &Option<String>) 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified admission
+//
+// Every execution endpoint — single, batch, sequence, stream — admits work
+// through these helpers, in the same order: edge (auth, quota) → concurrency
+// → session → egress. A denial returns before any tool runs, with the same
+// status code and `code` value on every endpoint.
+//
+// What is recorded: a call that executes a tool (success or failure outcome)
+// gets one audit record and one metrics observation. A call turned away at
+// admission never executed anything, so it gets no audit record; only the
+// concurrency shed is metered (it represents load the server refused).
+// ---------------------------------------------------------------------------
+
+/// 401/429 edge checks shared by every handler. `None` = admitted.
+fn admit_edge(
+    headers: &axum::http::HeaderMap,
+    peer: Option<SocketAddr>,
+    state: &AppState,
+) -> Option<Response> {
+    if let Some(resp) = check_auth(headers, state) {
+        return Some(resp);
+    }
+    if let Some(resp) = check_rate_limit(headers, peer, state) {
+        return Some(resp);
+    }
+    None
+}
+
+/// One concurrency permit shared by every execution handler.
+///
+/// The permit is held for the whole admitted request, so a `/v1/execute/stream`
+/// call counts against the cap exactly like the call it mirrors. The caller
+/// meters the shed load to keep `concurrency_limited` visible on every path.
+///
+/// `Response` is large (axum's body type), so this carries an allow rather
+/// than a box: boxing would add indirection to every admitted request to
+/// satisfy a lint about the denied ones.
+#[allow(clippy::result_large_err)]
+fn admit_concurrency(state: &AppState) -> Result<OwnedSemaphorePermit, Response> {
+    match state.semaphore.clone().try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(_) => {
+            state.metrics.observe_with_tool("", false, 0);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "too many concurrent executions".into(),
+                    code: "concurrency_limited".into(),
+                }),
+            )
+                .into_response())
+        }
+    }
+}
+
+fn session_not_found(sid: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("session not found: {sid}"),
+            code: "session_not_found".into(),
+        }),
+    )
+        .into_response()
+}
+
+fn session_expired(sid: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("session expired: {sid}"),
+            code: "session_expired".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// Session admission for one (`session_id`, `args`) pair: purge, lookup,
+/// expiry, then the session-root path check. `None` admitted the call —
+/// including when no session was named, which keeps the default-workspace
+/// behaviour of every endpoint.
+async fn admit_session(
+    state: &AppState,
+    session_id: Option<&String>,
+    args: &serde_json::Value,
+) -> Option<Response> {
+    let sid = session_id?;
+    // Opportunistically drop expired sessions before lookup.
+    purge_expired_sessions(state).await;
+    let sessions = state.sessions.lock().await;
+    match sessions.get(sid) {
+        Some(sess) if sess.is_expired(state.session_ttl) => Some(session_expired(sid)),
+        Some(sess) => check_session_path(sess, args),
+        None => Some(session_not_found(sid)),
+    }
+}
+
+/// Existence-only session check, for the per-step overrides on endpoints whose
+/// contract scopes paths to the top-level session (see `execute_sequence`).
+async fn require_session(state: &AppState, session_id: &str) -> Option<Response> {
+    purge_expired_sessions(state).await;
+    let sessions = state.sessions.lock().await;
+    match sessions.get(session_id) {
+        Some(sess) if sess.is_expired(state.session_ttl) => Some(session_expired(session_id)),
+        Some(_) => None,
+        None => Some(session_not_found(session_id)),
+    }
+}
+
+fn destination_forbidden(e: impl std::fmt::Display) -> Response {
+    let code = e.to_string();
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: code.clone(),
+            code,
+        }),
+    )
+        .into_response()
+}
+
+fn allowlist_forbidden(code: String) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: code.clone(),
+            code,
+        }),
+    )
+        .into_response()
+}
+
+/// Egress admission for one (`tool`, `args`) pair: the destination check runs
+/// first (it blocks metadata/private addresses regardless of the allowlist),
+/// then the configured host allowlist. Non-HTTP tools, and HTTP calls without
+/// a `url` string, pass here — the tool validates its own arguments next.
+async fn admit_egress(state: &AppState, tool: &str, args: &serde_json::Value) -> Option<Response> {
+    if tool != "http" {
+        return None;
+    }
+    let url = match args.get("url").and_then(|v| v.as_str()) {
+        Some(url) => url,
+        None => return None,
+    };
+    // Always validate destination (blocks 169.254.169.254, private ranges etc.)
+    if let Err(e) = dest::validate_destination(url) {
+        warn!(error = %e, url = %redacted_url(url), "egress blocked (destination)");
+        return Some(destination_forbidden(e));
+    }
+    // If allowlist configured via policy file or env, enforce it server-side
+    // (not just HttpTool).
+    let allowed = egress_allowed_hosts(state).await;
+    if !allowed.is_empty() {
+        let egress = EgressPolicy::new(allowed);
+        if let Err(err) = egress.check(url) {
+            warn!(error = %err.code, url = %err.url_redacted, "egress blocked (allowlist)");
+            return Some(allowlist_forbidden(err.code));
+        }
+    }
+    None
+}
+
+/// Session + egress admission for one item, in the order `execute` applies
+/// them. Batch and sequence call the two halves separately where their
+/// top-level/per-step contracts differ; `execute` and `execute_stream` call
+/// this directly so a streamed call can never skip what a single call checks.
+async fn admit_item(
+    state: &AppState,
+    session_id: Option<&String>,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<Response> {
+    if let Some(resp) = admit_session(state, session_id, args).await {
+        return Some(resp);
+    }
+    if let Some(resp) = admit_egress(state, tool, args).await {
+        return Some(resp);
+    }
+    None
+}
+
 // `headers` skipped: see `list_tools`. It carries the bearer token.
 #[tracing::instrument(skip(state, req, headers), fields(tool = %req.tool))]
 async fn execute(
@@ -597,92 +779,20 @@ async fn execute(
     headers: axum::http::HeaderMap,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    if let Some(resp) = check_rate_limit(&headers, peer.map(|p| p.0), &state) {
+    if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
     }
     state.metrics.inc_request();
     // Concurrency guard — 503 if at cap (pool).
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
+    let _permit = match admit_concurrency(&state) {
+        Ok(permit) => permit,
+        Err(resp) => return resp,
     };
 
     // Session validation: if session_id given, ensure it exists and paths are inside it.
-    if let Some(sid) = &req.session_id {
-        // Opportunistically drop expired sessions before lookup.
-        purge_expired_sessions(&state).await;
-        let sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get(sid) {
-            if sess.is_expired(state.session_ttl) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("session expired: {sid}"),
-                        code: "session_expired".into(),
-                    }),
-                )
-                    .into_response();
-            }
-            if let Some(resp) = check_session_path(sess, &req.args) {
-                return resp;
-            }
-        } else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("session not found: {sid}"),
-                    code: "session_not_found".into(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    // Egress proxy — server-side SSRF enforcement (Phase 3 defense-in-depth).
-    if req.tool == "http" {
-        if let Some(url) = req.args.get("url").and_then(|v| v.as_str()) {
-            // Always validate destination (blocks 169.254.169.254, private ranges etc.)
-            if let Err(e) = dest::validate_destination(url) {
-                warn!(error = %e, url = %redacted_url(url), "egress blocked (destination)");
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            // If allowlist configured via policy file or env, enforce it server-side (not just HttpTool).
-            let allowed = egress_allowed_hosts(&state).await;
-            if !allowed.is_empty() {
-                let egress = EgressPolicy::new(allowed);
-                if let Err(err) = egress.check(url) {
-                    warn!(error = %err.code, url = %err.url_redacted, "egress blocked (allowlist)");
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            error: err.code.clone(),
-                            code: err.code,
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        }
+    // Egress proxy — server-side SSRF enforcement (defense-in-depth).
+    if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
+        return resp;
     }
 
     let started = Instant::now();
@@ -743,10 +853,7 @@ async fn execute_batch(
     headers: axum::http::HeaderMap,
     Json(mut req): Json<BatchRequest>,
 ) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    if let Some(resp) = check_rate_limit(&headers, peer.map(|p| p.0), &state) {
+    if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
     }
     purge_expired_sessions(&state).await;
@@ -768,131 +875,46 @@ async fn execute_batch(
     let max = req.max_concurrency.unwrap_or(8).clamp(1, 32);
     // Try to acquire `max` permits or fail fast; simpler to acquire 1 global permit and rely on inner sem.
     // To avoid 32x blow-up, we acquire 1 but bound max to 32 and batch size to 64.
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
+    let _permit = match admit_concurrency(&state) {
+        Ok(permit) => permit,
+        Err(resp) => return resp,
     };
-    // Session validation (top-level + per-step)
+    // Session validation (top-level + per-step), then per-item egress.
+    // Each item is admitted against the top-level session when one is named
+    // (paths stay inside it) and additionally against its own per-step
+    // session override when present. The helpers hold the sessions lock only
+    // for one lookup each, so admission here cannot deadlock against itself.
     let top_sid = req.session_id.clone();
-    {
-        let sessions = state.sessions.lock().await;
-        if let Some(sid) = &top_sid {
-            if !sessions.contains_key(sid) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("session not found: {sid}"),
-                        code: "session_not_found".into(),
-                    }),
-                )
-                    .into_response();
+    if let Some(sid) = &top_sid {
+        // The top-level session must exist even for an empty batch: an
+        // unknown session is a 404 before any item runs.
+        if let Some(resp) = require_session(&state, sid).await {
+            return resp;
+        }
+        for r in &req.requests {
+            if let Some(resp) = admit_session(&state, top_sid.as_ref(), &r.args).await {
+                return resp;
             }
-            if let Some(sess) = sessions.get(sid) {
-                for r in &req.requests {
-                    if let Some(resp) = check_session_path(sess, &r.args) {
-                        return resp;
-                    }
-                    if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                        if r.tool == "http" {
-                            if let Err(e) = dest::validate_destination(url) {
-                                return (
-                                    StatusCode::FORBIDDEN,
-                                    Json(ErrorResponse {
-                                        error: e.to_string(),
-                                        code: e.to_string(),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                            let allowed = egress_allowed_hosts(&state).await;
-                            if !allowed.is_empty() {
-                                let egress = EgressPolicy::new(allowed);
-                                if let Err(err) = egress.check(url) {
-                                    return (
-                                        StatusCode::FORBIDDEN,
-                                        Json(ErrorResponse {
-                                            error: err.code.clone(),
-                                            code: err.code,
-                                        }),
-                                    )
-                                        .into_response();
-                                }
-                            }
-                        }
-                    }
-                    // Per-step session override validation
-                    if let Some(psid) = &r.session_id {
-                        if !sessions.contains_key(psid) {
-                            return (
-                                StatusCode::NOT_FOUND,
-                                Json(ErrorResponse {
-                                    error: format!("session not found: {psid}"),
-                                    code: "session_not_found".into(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        if let Some(psess) = sessions.get(psid) {
-                            if let Some(resp) = check_session_path(psess, &r.args) {
-                                return resp;
-                            }
-                        }
-                    }
+            if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
+                return resp;
+            }
+            // Per-step session override validation
+            if let Some(psid) = &r.session_id {
+                if let Some(resp) = admit_session(&state, Some(psid), &r.args).await {
+                    return resp;
                 }
             }
-        } else {
-            // No top-level session, still validate per-step sessions
-            for r in &req.requests {
-                if let Some(psid) = &r.session_id {
-                    if !sessions.contains_key(psid) {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("session not found: {psid}"),
-                                code: "session_not_found".into(),
-                            }),
-                        )
-                            .into_response();
-                    }
+        }
+    } else {
+        // No top-level session, still validate per-step sessions
+        for r in &req.requests {
+            if let Some(psid) = &r.session_id {
+                if let Some(resp) = require_session(&state, psid).await {
+                    return resp;
                 }
-                if r.tool == "http" {
-                    if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                        if let Err(e) = dest::validate_destination(url) {
-                            return (
-                                StatusCode::FORBIDDEN,
-                                Json(ErrorResponse {
-                                    error: e.to_string(),
-                                    code: e.to_string(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        let allowed = egress_allowed_hosts(&state).await;
-                        if !allowed.is_empty() {
-                            let egress = EgressPolicy::new(allowed);
-                            if let Err(err) = egress.check(url) {
-                                return (
-                                    StatusCode::FORBIDDEN,
-                                    Json(ErrorResponse {
-                                        error: err.code.clone(),
-                                        code: err.code,
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                }
+            }
+            if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
+                return resp;
             }
         }
     }
@@ -905,6 +927,8 @@ async fn execute_batch(
     for r in results {
         match r {
             Ok(o) => {
+                // One audit record per executed item, as in `execute`.
+                audit_log(&state, &o, o.duration_ms).await;
                 let tool = o.tool.clone();
                 state
                     .metrics
@@ -928,10 +952,7 @@ async fn execute_sequence(
     headers: axum::http::HeaderMap,
     Json(mut req): Json<SequenceRequest>,
 ) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
-        return resp;
-    }
-    if let Some(resp) = check_rate_limit(&headers, peer.map(|p| p.0), &state) {
+    if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
     }
     purge_expired_sessions(&state).await;
@@ -948,96 +969,41 @@ async fn execute_sequence(
         )
             .into_response();
     }
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.observe_with_tool("", false, 0);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
-        }
+    let _permit = match admit_concurrency(&state) {
+        Ok(permit) => permit,
+        Err(resp) => return resp,
     };
+    // Session validation mirrors the batch contract: paths are scoped to the
+    // top-level session, and per-step overrides must at least name a live
+    // session. Egress is admitted per step afterwards, before anything runs.
     if let Some(sid) = &req.session_id {
-        let sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get(sid) {
-            for r in &req.steps {
-                if let Some(resp) = check_session_path(sess, &r.args) {
+        // The top-level session must exist even for an empty sequence.
+        if let Some(resp) = require_session(&state, sid).await {
+            return resp;
+        }
+        for r in &req.steps {
+            if let Some(resp) = admit_session(&state, Some(sid), &r.args).await {
+                return resp;
+            }
+            if let Some(psid) = &r.session_id {
+                if let Some(resp) = require_session(&state, psid).await {
                     return resp;
                 }
-                if let Some(psid) = &r.session_id {
-                    if !sessions.contains_key(psid) {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(ErrorResponse {
-                                error: format!("session not found: {psid}"),
-                                code: "session_not_found".into(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
             }
-        } else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("session not found: {sid}"),
-                    code: "session_not_found".into(),
-                }),
-            )
-                .into_response();
         }
     } else {
-        let sessions = state.sessions.lock().await;
         for r in &req.steps {
             if let Some(psid) = &r.session_id {
-                if !sessions.contains_key(psid) {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            error: format!("session not found: {psid}"),
-                            code: "session_not_found".into(),
-                        }),
-                    )
-                        .into_response();
+                if let Some(resp) = require_session(&state, psid).await {
+                    return resp;
                 }
             }
         }
     }
     // Egress check for each step if http
     for r in &req.steps {
-        if r.tool == "http" {
-            if let Some(url) = r.args.get("url").and_then(|v| v.as_str()) {
-                if let Err(e) = dest::validate_destination(url) {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            error: e.to_string(),
-                            code: e.to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-                let allowed = egress_allowed_hosts(&state).await;
-                if !allowed.is_empty() {
-                    let egress = EgressPolicy::new(allowed);
-                    if let Err(err) = egress.check(url) {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(ErrorResponse {
-                                error: err.code.clone(),
-                                code: err.code,
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
+        if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
+            return resp;
         }
     }
     let continue_on_error = req.continue_on_error.unwrap_or(false);
@@ -1052,6 +1018,8 @@ async fn execute_sequence(
     for r in results {
         match r {
             Ok(o) => {
+                // One audit record per executed step, as in `execute`.
+                audit_log(&state, &o, o.duration_ms).await;
                 let tool = o.tool.clone();
                 state
                     .metrics
@@ -1079,45 +1047,64 @@ async fn execute_sequence(
 
 /// SSE streaming — uniform SSE for all tools (shell chunks, others single outcome).
 /// Non-shell tools emit `summary` then `done` so SDKs can always parse SSE.
+///
+/// Admission is identical to [`execute`]: edge, concurrency, session, egress.
+/// An `idempotency_key` is honored exactly as in `execute` — the same key on
+/// the same call replays the cached success instead of running the tool
+/// again. Executed outcomes are audited and metered like `execute`; a call
+/// the registry rejects becomes an SSE `error` event, mirroring the 400
+/// `execute` would return for the same call.
 async fn execute_stream(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
-    if let Some(resp) = check_auth(&headers, &state) {
+    if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
     }
-    if let Some(resp) = check_rate_limit(&headers, peer.map(|p| p.0), &state) {
+    state.metrics.inc_request();
+    let _permit = match admit_concurrency(&state) {
+        Ok(permit) => permit,
+        Err(resp) => return resp,
+    };
+    // Same session + egress admission as `execute`: a streamed call can never
+    // skip what a single call checks.
+    if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
         return resp;
     }
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "too many concurrent executions".into(),
-                    code: "concurrency_limited".into(),
-                }),
-            )
-                .into_response();
+
+    let started = Instant::now();
+    let registry = state.registry.read().await.clone();
+    let outcome = if let Some(key) = req.idempotency_key {
+        match registry.execute_once(&key, &req.tool, req.args).await {
+            Ok(o) => o,
+            Err(e) => {
+                let err_event = Event::default()
+                    .event("error")
+                    .data(serde_json::json!({"error": e.to_string()}).to_string());
+                let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
+                return Sse::new(stream).into_response();
+            }
+        }
+    } else {
+        match registry.execute(&req.tool, req.args).await {
+            Ok(o) => o,
+            Err(e) => {
+                let err_event = Event::default()
+                    .event("error")
+                    .data(serde_json::json!({"error": e.to_string()}).to_string());
+                let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
+                return Sse::new(stream).into_response();
+            }
         }
     };
 
-    // For P2 we execute then stream buffered chunks as SSE.
-    // Real streaming will call `ShellTool::execute_streaming` directly.
-    let registry = state.registry.read().await.clone();
-    let outcome = match registry.execute(&req.tool, req.args).await {
-        Ok(o) => o,
-        Err(e) => {
-            let err_event = Event::default()
-                .event("error")
-                .data(serde_json::json!({"error": e.to_string()}).to_string());
-            let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
-            return Sse::new(stream).into_response();
-        }
-    };
+    // Audit + metrics exactly as `execute`: one record per executed tool.
+    audit_log(&state, &outcome, started.elapsed().as_millis() as u64).await;
+    state
+        .metrics
+        .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
 
