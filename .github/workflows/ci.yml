@@ -53,6 +53,18 @@ jobs:
       # and it is now strict enough to reject itself if someone edits it wrong.
       - run: cargo run --bin marshalld -- --validate-config ./marshall.yaml
 
+      # The SDKs ship auth headers and session/policy methods with no runtime
+      # dependencies of their own; stub-transport tests pin that contract.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test sdk/js/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python3 sdk/python/test_sdk_auth.py
+
   msrv:
     name: MSRV 1.88
     runs-on: ubuntu-latest

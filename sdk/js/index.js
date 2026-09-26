@@ -2,43 +2,72 @@
 // npm: marshall-sdk (scaffold)
 // Usage:
 //   import { ExecutionClient } from './index.js'
-//   const c = new ExecutionClient('http://localhost:3000')
+//   const c = new ExecutionClient('http://localhost:3000', { token: process.env.MARSHALLD_API_TOKEN })
 //   await c.execute('shell', {program:'/bin/echo', args:['hi']})
 //   for await (const chunk of c.stream('shell', {program:'/bin/echo', args:['hi']})) console.log(chunk)
+//
+// The token is sent as `Authorization: Bearer <token>` on every request and
+// is never copied into errors, logs, or execution summaries.
 
 export class ExecutionClient {
   constructor(baseUrl, opts = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.fetch = opts.fetch || globalThis.fetch;
+    this.token = opts.token || null;
+  }
+
+  // Authorization header for every API request. Absent when no token was
+  // configured, so the client also works against open local deployments.
+  authHeaders() {
+    return this.token ? { authorization: `Bearer ${this.token}` } : {};
   }
 
   async health() {
-    const r = await this.fetch(`${this.baseUrl}/health`);
+    const r = await this.fetch(`${this.baseUrl}/health`, { headers: { ...this.authHeaders() } });
     if (!r.ok) throw new Error(`health ${r.status}`);
     return r.json();
   }
 
   async tools() {
-    const r = await this.fetch(`${this.baseUrl}/v1/tools`);
+    const r = await this.fetch(`${this.baseUrl}/v1/tools`, { headers: { ...this.authHeaders() } });
     if (!r.ok) throw new Error(`tools ${r.status}`);
     return r.json();
+  }
+
+  // The policy endpoint returns the active `marshall.yaml` as YAML text,
+  // not JSON — callers get the raw string.
+  async policy() {
+    const r = await this.fetch(`${this.baseUrl}/v1/policy`, { headers: { ...this.authHeaders() } });
+    if (!r.ok) throw new Error(`policy ${r.status}`);
+    return r.text();
   }
 
   async createSession(label) {
     const r = await this.fetch(`${this.baseUrl}/v1/sessions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify({ label }),
     });
     if (!r.ok) throw new Error(`createSession ${r.status}: ${await r.text()}`);
     return r.json();
   }
 
+  async deleteSession(sessionId) {
+    const r = await this.fetch(`${this.baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+      headers: { ...this.authHeaders() },
+    });
+    // 204 carries no body: success is the status itself.
+    if (r.status === 204) return true;
+    if (!r.ok) throw new Error(`deleteSession ${r.status}: ${await r.text()}`);
+    return true;
+  }
+
   async execute(tool, args, opts = {}) {
     const body = { tool, args, session_id: opts.sessionId, idempotency_key: opts.idempotencyKey };
     const r = await this.fetch(`${this.baseUrl}/v1/execute`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -66,14 +95,14 @@ export class ExecutionClient {
 
   async batch(requests, opts = {}) {
     const body = { requests: requests.map((e) => ExecutionClient.#toRequest(e)), max_concurrency: opts.maxConcurrency, session_id: opts.sessionId };
-    const r = await this.fetch(`${this.baseUrl}/v1/execute/batch`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await this.fetch(`${this.baseUrl}/v1/execute/batch`, { method: 'POST', headers: { 'content-type': 'application/json', ...this.authHeaders() }, body: JSON.stringify(body) });
     if (!r.ok) throw new Error(`batch ${r.status}: ${await r.text()}`);
     return r.json();
   }
 
   async sequence(steps, opts = {}) {
     const body = { steps: steps.map((e) => ExecutionClient.#toRequest(e)), continue_on_error: opts.continueOnError, session_id: opts.sessionId };
-    const r = await this.fetch(`${this.baseUrl}/v1/execute/sequence`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await this.fetch(`${this.baseUrl}/v1/execute/sequence`, { method: 'POST', headers: { 'content-type': 'application/json', ...this.authHeaders() }, body: JSON.stringify(body) });
     if (!r.ok) throw new Error(`sequence ${r.status}: ${await r.text()}`);
     return r.json();
   }
@@ -82,7 +111,7 @@ export class ExecutionClient {
     const body = { tool, args, session_id: opts.sessionId, idempotency_key: opts.idempotencyKey };
     const r = await this.fetch(`${this.baseUrl}/v1/execute/stream`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...this.authHeaders() },
       body: JSON.stringify(body),
     });
     if (!r.ok || !r.body) throw new Error(`stream ${r.status}`);
