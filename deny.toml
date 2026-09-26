@@ -33,8 +33,8 @@ confidence-threshold = 0.9
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# `watchdog` is only in the graph with `--features container`, so this list is
-# empty for a default check. Add the repository here if that feature is ever
-# checked in CI — it is unpublished, which is itself a release blocker for
-# shipping the feature to anyone else (tracked in ROADMAP.md).
+# No git dependencies remain: the `watchdog` container dependency was removed
+# (MAR-P0-002 — the assumed Firecracker API never existed at the pinned
+# revision, and the silent local fallback was a downgrade). `allow-git` stays
+# empty so reintroducing an unpublished dependency fails the build.
 allow-git = []

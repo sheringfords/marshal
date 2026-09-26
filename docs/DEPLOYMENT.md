@@ -142,7 +142,7 @@ privileges. The deployment provides the containment:
 | Policy only (default) | Path, host, and command allowlists. Fine for trusted callers. |
 | Container/VM around the daemon | The unit above, or a locked-down container. What most deployments should do. |
 | `--features wasm` | wasmtime fuel and memory caps, WASI preopen. For `code`. |
-| `--features container` | Firecracker via `watchdog`, needs Linux KVM. Unpublished dependency; not ready to ship. |
+| `ContainerBackend` | Fail-closed placeholder: refuses every request with `isolation_unavailable`. Not containment. |
 
 If callers are untrusted, do not enable `code` on the local backend. The gate
 in `marshall.yaml` exists because the tool otherwise reads any file the daemon
