@@ -9,7 +9,8 @@
 //! ToolRegistry -> ShellTool (policy) -> ExecutionBackend (mechanism)
 //!                                    ├─ LocalProcessBackend (dev, current)
 //!                                    ├─ WasmBackend (wasmtime fuel/memory)
-//!                                    └─ ContainerBackend (watchdog/Firecracker)
+//!                                    └─ ContainerBackend (fail-closed placeholder;
+//!                                       no isolation runtime is wired yet)
 //! ```
 //!
 //! This module provides the trait and the `LocalProcessBackend` implementation.
@@ -19,6 +20,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(feature = "wasm")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,8 +93,9 @@ pub struct ExecOutput {
 
 /// Backend that actually runs the request.
 ///
-/// `LocalProcessBackend` is the current behaviour. `WasmBackend`/`ContainerBackend`
-/// will enforce stronger isolation (seccomp/cgroup/Firecracker) via `watchdog`.
+/// `LocalProcessBackend` is the current behaviour. `WasmBackend` enforces
+/// fuel/memory/epoch limits on wasm modules; `ContainerBackend` is a
+/// fail-closed placeholder until a real isolation runtime is integrated.
 #[async_trait::async_trait]
 pub trait ExecutionBackend: Send + Sync + std::fmt::Debug {
     /// Human name for metrics/tracing (`local`, `wasm`, `container`).
@@ -594,23 +597,27 @@ fn truncate_bytes(mut v: Vec<u8>, limit: usize) -> (Vec<u8>, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// ContainerBackend — Firecracker via `watchdog` crate (Phase 4)
+// ContainerBackend — fail-closed placeholder (MAR-P0-002)
 // ---------------------------------------------------------------------------
 
-/// Container/Firecracker backend. Delegates to sibling `watchdog` crate for
-/// cgroup/seccomp/namespace. On macOS or without KVM, falls back to
-/// `LocalProcessBackend` with a warning.
+/// Container/microVM backend: currently a fail-closed placeholder.
 ///
-/// Wiring (see `docs/ARCHITECTURE.md:19`):
-/// ```text
-/// // Pool per workspace: watchdog::Pool::new(Config{
-/// //   kernel: "vmlinux", rootfs: "alpine.ext4", vsock: "/tmp/firecracker.sock",
-/// //   cgroup: Limits{ memory_bytes: Some(128<<20), pids_max: Some(64) },
-/// //   seccomp: true,
-/// // })
-/// // pool.exec(ExecRequest{ program: "/bin/bash", args: ["-c","echo hi"], ... }).await
-/// ```
-#[derive(Debug, Clone)]
+/// History: this type used to delegate to a `watchdog` crate behind the
+/// `container` feature, falling back to [`LocalProcessBackend`] with a
+/// warning when KVM was unavailable. That wiring was removed because the
+/// dependency it assumed does not exist — the pinned `watchdog` revision
+/// exposes a cgroup-supervisor API (`Supervisor`, `Bounds`), not the
+/// Firecracker `Pool`/`Config`/`ExecRequest` API the code called, so the
+/// feature never compiled, and the fallback silently ran isolated-labeled
+/// work without isolation.
+///
+/// Until a real, published isolation integration lands, `execute` refuses
+/// every request with an `isolation_unavailable` error instead of running
+/// it anywhere. The builder fields are kept so call sites and policy shapes
+/// survive the eventual integration. `name()` still reports `"container"`,
+/// and because nothing ever executes under it, the identity is honest: no
+/// outcome is ever attributed to isolation that did not happen.
+#[derive(Debug, Clone, Default)]
 pub struct ContainerBackend {
     /// Image or microVM kernel path (e.g. "alpine:3.19" or "/path/to/vmlinux").
     pub image: Option<String>,
@@ -620,20 +627,6 @@ pub struct ContainerBackend {
     pub rootfs: Option<PathBuf>,
     /// Vsock path for Firecracker communication.
     pub vsock: Option<PathBuf>,
-    /// Fallback backend for non-Linux or when KVM unavailable.
-    fallback: Arc<dyn ExecutionBackend>,
-}
-
-impl Default for ContainerBackend {
-    fn default() -> Self {
-        Self {
-            image: None,
-            kernel: None,
-            rootfs: None,
-            vsock: None,
-            fallback: Arc::new(LocalProcessBackend),
-        }
-    }
 }
 
 impl ContainerBackend {
@@ -657,12 +650,6 @@ impl ContainerBackend {
         self
     }
 
-    /// Set fallback backend (used on macOS).
-    pub fn with_fallback(mut self, backend: Arc<dyn ExecutionBackend>) -> Self {
-        self.fallback = backend;
-        self
-    }
-
     #[cfg(target_os = "linux")]
     fn is_kvm_available() -> bool {
         std::path::Path::new("/dev/kvm").exists()
@@ -681,101 +668,22 @@ impl ExecutionBackend for ContainerBackend {
     }
 
     async fn execute(&self, req: ExecRequest) -> anyhow::Result<ExecOutput> {
-        // On non-Linux or without KVM, fallback to local with warning is the
-        // documented behavior (docs/ARCHITECTURE.md:36).
-        if !Self::is_kvm_available() {
-            tracing::warn!(
-                image = ?self.image,
-                "kvm not available (macOS or /dev/kvm missing), falling back to LocalProcessBackend"
-            );
-            return self.fallback.execute(req).await;
+        let _ = req;
+        // Fail closed. An earlier revision fell back to LocalProcessBackend
+        // here with a warning; a warning is not a control, and the response
+        // still claimed the `container` backend. Refusing is the only honest
+        // behaviour until a real isolation integration exists.
+        if Self::is_kvm_available() {
+            anyhow::bail!(
+                "isolation_unavailable: container backend has no isolation integration \
+                 (kvm present but no runtime wired); refusing to execute"
+            )
+        } else {
+            anyhow::bail!(
+                "isolation_unavailable: container backend requires Linux KVM and an \
+                 isolation runtime; refusing to execute (no local fallback)"
+            )
         }
-
-        // If watchdog feature is enabled, delegate to it. Otherwise fallback
-        // with warning to LocalProcessBackend (so darwin and non-container
-        // builds still work, but log that isolation is not enforced).
-        #[cfg(feature = "container")]
-        {
-            return self.execute_via_watchdog(req).await;
-        }
-        #[cfg(not(feature = "container"))]
-        {
-            tracing::warn!(
-                "container feature not enabled, falling back to LocalProcessBackend (no isolation)"
-            );
-            return self.fallback.execute(req).await;
-        }
-    }
-}
-
-#[cfg(feature = "container")]
-impl ContainerBackend {
-    async fn execute_via_watchdog(&self, req: ExecRequest) -> anyhow::Result<ExecOutput> {
-        // This is the real wiring to watchdog crate. The exact types depend on
-        // the watchdog version; we map our ExecRequest -> watchdog::ExecRequest
-        // and ExecOutput -> our ExecOutput. If watchdog API changes, this is the
-        // single place to update.
-        //
-        // For now, we construct a watchdog Pool per-request (in production, pool
-        // would be shared per workspace). This keeps the implementation simple
-        // and avoids global state while still validating the wiring.
-        use watchdog::{Config, Limits as WdLimits, Pool};
-
-        let limits = WdLimits {
-            memory_bytes: req.limits.memory_bytes.or(Some(128 << 20)),
-            pids_max: Some(64),
-            cpu_time: req.limits.cpu_time,
-        };
-
-        let config = Config {
-            kernel: self
-                .kernel
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("vmlinux")),
-            rootfs: self
-                .rootfs
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("alpine.ext4")),
-            vsock: self
-                .vsock
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/tmp/firecracker.sock")),
-            cgroup: limits,
-            seccomp: true,
-        };
-
-        // Pool is cheap to create for the stub; real watchdog would cache.
-        let pool = Pool::new(config).map_err(|e| anyhow::anyhow!("watchdog pool: {e}"))?;
-
-        // Map our ExecRequest to watchdog's type. Watchdog is expected to have
-        // a compatible ExecRequest; if not, we adapt here.
-        let wd_req = watchdog::ExecRequest {
-            program: req.program.clone(),
-            args: req.args.clone(),
-            working_dir: req.working_dir.clone(),
-            env: req.env.clone(),
-            stdin: req.stdin.clone(),
-            limits: watchdog::ResourceLimits {
-                timeout: req.limits.timeout,
-                output_limit: req.limits.output_limit,
-                cpu_time: req.limits.cpu_time,
-                memory_bytes: req.limits.memory_bytes,
-            },
-        };
-
-        let wd_out = pool
-            .exec(wd_req)
-            .await
-            .map_err(|e| anyhow::anyhow!("watchdog exec: {e}"))?;
-
-        Ok(ExecOutput {
-            exit_code: wd_out.exit_code,
-            stdout: wd_out.stdout,
-            stderr: wd_out.stderr,
-            stdout_truncated: wd_out.stdout_truncated,
-            stderr_truncated: wd_out.stderr_truncated,
-            timed_out: wd_out.timed_out,
-        })
     }
 }
 
@@ -855,19 +763,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn container_backend_falls_back_on_macos() {
-        // On macOS / no KVM, ContainerBackend should fallback to LocalProcessBackend
-        let backend = ContainerBackend::default();
-        // is_kvm_available should be false on macOS
-        if ContainerBackend::is_kvm_available() {
-            return;
-        }
+    async fn container_backend_refuses_rather_than_falling_back() {
+        // MAR-P0-002: requesting the container backend must never silently
+        // run the workload locally. It refuses on every platform — including
+        // Linux with KVM, where there is still no runtime wired.
+        let backend = ContainerBackend::new("alpine:3.19")
+            .with_kernel("/tmp/vmlinux")
+            .with_rootfs("/tmp/alpine.ext4");
+        assert_eq!(backend.image.as_deref(), Some("alpine:3.19"));
+        assert_eq!(
+            backend.kernel.as_deref(),
+            Some(std::path::Path::new("/tmp/vmlinux"))
+        );
+        assert_eq!(backend.name(), "container");
         let echo = if std::path::Path::new("/bin/echo").exists() {
             "/bin/echo"
         } else {
             "/usr/bin/echo"
         };
-        let out = backend
+        let err = backend
             .execute(ExecRequest {
                 program: echo.into(),
                 args: vec!["hello".into()],
@@ -881,45 +795,36 @@ mod tests {
                 },
             })
             .await
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0));
-        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
-        assert!(!out.timed_out);
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("isolation_unavailable"),
+            "container backend did not fail closed: {err}"
+        );
     }
 
     #[tokio::test]
-    async fn container_backend_resource_limits_mapped() {
-        let backend = ContainerBackend::new("alpine:3.19")
-            .with_kernel("/tmp/vmlinux")
-            .with_rootfs("/tmp/alpine.ext4");
-        assert_eq!(backend.image.as_deref(), Some("alpine:3.19"));
-        assert_eq!(
-            backend.kernel.as_deref(),
-            Some(std::path::Path::new("/tmp/vmlinux"))
-        );
-        // On macOS, it will still fallback but should not panic on ResourceLimits
+    async fn shell_tool_on_the_container_backend_reports_unavailable() {
+        // End to end through `ShellTool`: no process spawns, and the caller
+        // learns the backend — not a tool failure — is unavailable.
+        use crate::shell::AllowedCommand;
+        use crate::{ArgumentPolicy, ShellTool, Tool};
         let echo = if std::path::Path::new("/bin/echo").exists() {
             "/bin/echo"
         } else {
             "/usr/bin/echo"
         };
-        let out = backend
-            .execute(ExecRequest {
-                program: echo.into(),
-                args: vec!["test".into()],
-                working_dir: None,
-                env: HashMap::new(),
-                stdin: None,
-                limits: ResourceLimits {
-                    timeout: Duration::from_secs(1),
-                    output_limit: 1024,
-                    cpu_time: Some(Duration::from_secs(1)),
-                    memory_bytes: Some(64 * 1024 * 1024),
-                },
-            })
+        let tool = ShellTool::new(vec![
+            AllowedCommand::new(echo).with_arguments(ArgumentPolicy::NoFlags)
+        ])
+        .with_backend(std::sync::Arc::new(ContainerBackend::default()));
+        let err = tool
+            .execute(serde_json::json!({"program": echo, "args": ["hi"]}))
             .await
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0));
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("isolation_unavailable"),
+            "shell did not surface the backend refusal: {err}"
+        );
     }
 
     #[tokio::test]

@@ -244,7 +244,7 @@ impl ShellTool {
 
     /// Streaming execution — returns chunks instead of buffering all output.
     /// Shape matches what `executor.sh` SSE needs; `LocalProcessBackend` currently
-    /// buffers then chunks, `ContainerBackend` will stream truly.
+    /// buffers then chunks.
     pub async fn execute_streaming(&self, args: Value) -> Result<crate::backend::StreamingOutput> {
         let started = Instant::now();
         let (program, arguments, working_dir, stdin) = self.parse(&args)?;

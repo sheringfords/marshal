@@ -193,8 +193,8 @@ pub struct HttpPolicy {
 ///
 /// So enabling a language is not enough. [`CodePolicy::allow_unsandboxed`]
 /// must also be set, which is the operator saying in the config file that they
-/// know the other policies do not apply here. Isolating backends (`wasm`,
-/// `container`) do not need it.
+/// know the other policies do not apply here. The isolating `wasm` backend
+/// does not need it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodePolicy {
     /// Languages the tool will run. Empty means the tool is not registered.
