@@ -63,6 +63,21 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo check --features experiment --all-targets
 
+  # The wasm isolation backend broke without anyone noticing because no job
+  # compiled it (MAR-P0-001). It builds, lints, and runs real WASI workloads
+  # here — compilation alone is not accepted as isolation evidence.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features wasm --all-targets
+      - run: cargo clippy --features wasm --all-targets -- -D warnings
+      - run: cargo test --features wasm --lib
+
   docs:
     runs-on: ubuntu-latest
     steps:
