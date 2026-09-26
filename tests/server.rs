@@ -1373,6 +1373,64 @@ async fn batch_and_sequence_report_per_item_failures_without_failing_the_request
 }
 
 #[tokio::test]
+async fn batch_and_sequence_executions_are_audited() {
+    let ws = Workspace::new("admission_multi_audit");
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with(ServerConfig {
+        audit_path: Some(audit_path.clone()),
+        ..ws.config()
+    });
+    let echo = echo_path();
+
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [
+                execute("shell", json!({"program": echo, "args": ["one"]})),
+                execute("system", json!({"operation": "now"})),
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute/sequence",
+            json!({"steps": [execute("shell", json!({"program": echo, "args": ["two"]}))]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Three executed tools → three audit records, one per item.
+    let mut records = vec![];
+    for _ in 0..50 {
+        if audit_path.exists() {
+            let text = std::fs::read_to_string(&audit_path).unwrap();
+            records = text.lines().map(str::to_string).collect::<Vec<_>>();
+            if records.len() >= 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), 3, "{records:?}");
+    let tools: Vec<String> = records
+        .iter()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["tool"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(tools, vec!["shell", "system", "shell"]);
+}
+
+#[tokio::test]
 async fn aborting_a_stream_mid_flight_does_not_wedge_the_server() {
     let ws = Workspace::new("admission_stream_abort");
     std::fs::write(ws.path("big.txt"), vec![b'x'; 1_000_000]).unwrap();

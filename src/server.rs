@@ -927,6 +927,8 @@ async fn execute_batch(
     for r in results {
         match r {
             Ok(o) => {
+                // One audit record per executed item, as in `execute`.
+                audit_log(&state, &o, o.duration_ms).await;
                 let tool = o.tool.clone();
                 state
                     .metrics
@@ -1016,6 +1018,8 @@ async fn execute_sequence(
     for r in results {
         match r {
             Ok(o) => {
+                // One audit record per executed step, as in `execute`.
+                audit_log(&state, &o, o.duration_ms).await;
                 let tool = o.tool.clone();
                 state
                     .metrics
