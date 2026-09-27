@@ -259,16 +259,98 @@ async fn concurrent_scoped_writes_stay_inside() {
 }
 
 /// Repeated failures and cancellation must not leak file descriptors.
+///
+/// The measurement runs in a CHILD PROCESS (this same test binary re-executed
+/// with `MARSHALL_FD_CHILD=1`): `/proc/self/fd` is process-wide, so counting
+/// in-process races sibling tests' runtimes (epoll/eventfd/socketpair churn)
+/// and flakes independently of our code. The child performs the identical
+/// workload — 400 failing reads plus a cancelled batch — with no siblings,
+/// so any growth is attributable to the filesystem implementation alone.
+/// Leak-detection power is unchanged (same ops, same bound); only the
+/// interference is removed. See docs/engineering/FD_STABILITY_INVESTIGATION.md.
+#[test]
+#[cfg(target_os = "linux")]
+fn fd_count_is_stable_across_failures() {
+    if std::env::var("MARSHALL_FD_CHILD").is_ok() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("fd_child_workload")
+        .arg("--nocapture")
+        .env("MARSHALL_FD_CHILD", "1")
+        .output()
+        .expect("spawn fd child");
+    assert!(
+        out.status.success(),
+        "fd child failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (before, after) = parse_fd_counts(&stdout);
+    assert!(
+        after <= before + 8,
+        "fd leak in isolated child: {before} -> {after}\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn parse_fd_counts(stdout: &str) -> (usize, usize) {
+    let mut before = None;
+    let mut after = None;
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("FD_BEFORE=") {
+            before = v.trim().parse().ok();
+        }
+        if let Some(v) = line.strip_prefix("FD_AFTER=") {
+            after = v.trim().parse().ok();
+        }
+    }
+    (
+        before.expect("child FD_BEFORE"),
+        after.expect("child FD_AFTER"),
+    )
+}
+
+/// Child side of [`fd_count_is_stable_across_failures`]: runs the workload
+/// and prints `FD_BEFORE=`/`FD_AFTER=` lines. Invoked only via re-exec with
+/// `MARSHALL_FD_CHILD=1`; the parent guard above keeps it out of normal runs.
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn fd_count_is_stable_across_failures() {
+async fn fd_child_workload() {
+    if std::env::var("MARSHALL_FD_CHILD").is_err() {
+        return;
+    }
     fn fd_count() -> usize {
         std::fs::read_dir("/proc/self/fd")
             .map(|d| d.count())
             .unwrap_or(0)
     }
+    fn fd_targets() -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+            for entry in dir.flatten() {
+                let target = std::fs::read_link(entry.path())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "?".to_string());
+                out.push(target);
+            }
+        }
+        out.sort();
+        out
+    }
     let f = Fixture::new("fds");
     let tool = f.tool();
+    // Warm up the runtime and fixture so steady-state fds (epoll, eventfd)
+    // exist in both snapshots.
+    for _ in 0..5 {
+        let _ = tool
+            .execute(
+                json!({"operation": "read", "path": f.at("root/missing.txt").to_string_lossy()}),
+            )
+            .await;
+    }
     let before = fd_count();
     for _ in 0..200 {
         let _ = tool
@@ -294,6 +376,10 @@ async fn fd_count_is_stable_across_failures() {
         _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
     }
     tokio::task::yield_now().await;
+    // Extra quiesce so cancelled blocking tasks finish closing.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let after = fd_count();
-    assert!(after <= before + 8, "fd leak: {before} -> {after}");
+    println!("FD_BEFORE={before}");
+    println!("FD_AFTER={after}");
+    println!("FD_TARGETS_AFTER={:?}", fd_targets());
 }
