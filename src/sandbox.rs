@@ -235,95 +235,486 @@ impl Sandbox {
         }
         Err(SandboxError::Outside)
     }
+}
 
-    /// Linux: open file via `openat2` and keep fd for I/O (closes TOCTOU for read).
-    /// Returns `File` opened with `O_RDONLY` and `RESOLVE_BENEATH`.
-    #[cfg(target_os = "linux")]
-    pub fn open_existing_file(
+// Descriptor-retained containment (M2-003).
+//
+// [`Sandbox::resolve_*`] answers "is this path inside?" and hands back a
+// pathname; anything that reopens that pathname later races a symlink swap
+// (see `tests/toctou.rs` for the demonstration). [`BoundDir`] closes the
+// race the other way round: it opens the authorized root *directory* once,
+// then performs every operation relative to retained directory descriptors,
+// never following an attacker-controlled symlink.
+//
+// Symlink policy (uniform on every platform):
+//
+// - Intermediate components are never traversed through symlinks. A link
+//   where a directory is required fails the operation closed.
+// - `.` and `..` components are rejected outright, so `BENEATH`-style
+//   escapes cannot be spelled even where the kernel would permit them.
+// - The final component of a *create* target (`write`, `mkdir`, copy/move
+//   destination) is never followed: an existing symlink there fails closed,
+//   matching [`Sandbox::resolve_for_create`].
+// - The final component of a *read* target may be opened following links,
+//   but only through [`BoundDir::open_verified`], which reports the true
+//   post-open path of the obtained descriptor and requires it inside the
+//   root. The descriptor cannot be swapped after opening, so the check is
+//   not racy the way pathname checks are.
+//
+// On Linux, opens additionally request `openat2` `RESOLVE_BENEATH |
+// RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` so the kernel enforces the
+// same policy; where the kernel predates `openat2` (`ENOSYS`) the call falls
+// back to the portable `openat` walk with identical no-follow semantics
+// (loudly documented, never silently path-based). Descriptors are
+// [`OwnedFd`]s: dropping a [`BoundDir`] or a returned file releases them,
+// including on task cancellation.
+
+// POSIX file-type bits (universal on unix targets; rustix 0.38 does not
+// re-export S_IFMT/S_IFDIR at this path).
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+
+/// What a descriptor-retained operation can report.
+#[derive(Debug)]
+pub enum BoundError {
+    /// Resolution would leave the bound root (symlink, `..`, absolute path).
+    Outside,
+    /// A component or leaf does not exist where existence was required.
+    Unresolvable,
+    /// I/O failed after containment was established (permissions, busy…).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for BoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoundError::Outside => write!(f, "path is outside the bound root"),
+            BoundError::Unresolvable => write!(f, "path does not resolve inside the bound root"),
+            BoundError::Io(e) => write!(f, "i/o error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BoundError {}
+
+/// A canonical root with a retained directory descriptor.
+///
+/// Bind once per operation (or per request): opening the root is cheap, and
+/// per-operation binding keeps descriptor lifetime strictly inside the call,
+/// so cancellation and errors release everything through RAII.
+#[derive(Debug)]
+pub struct BoundDir {
+    /// Canonical root this descriptor was opened on (error messages, `..`
+    /// math, and true-path verification).
+    root: PathBuf,
+    /// Open directory descriptor of `root`.
+    fd: rustix::fd::OwnedFd,
+}
+
+impl BoundDir {
+    /// Open and retain `root`, which must already exist as a directory.
+    pub fn bind(root: &Path) -> Result<Self, BoundError> {
+        use rustix::fd::AsFd;
+        use rustix::fs::{openat, Mode, OFlags};
+        let canonical = root.canonicalize().map_err(|_| BoundError::Unresolvable)?;
+        if !canonical.is_dir() {
+            return Err(BoundError::Unresolvable);
+        }
+        let cwd = rustix::fs::CWD;
+        let fd = openat(
+            cwd,
+            &canonical,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_outside)?;
+        // Confirm we opened a directory, not something smuggled in.
+        let _ = rustix::fs::fstat(fd.as_fd()).map_err(|_| BoundError::Unresolvable)?;
+        Ok(BoundDir {
+            root: canonical,
+            fd,
+        })
+    }
+
+    /// Canonical root this directory is bound to.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Borrow the retained directory descriptor (for `fstat` of the bound
+    /// directory itself and directory iteration).
+    pub fn as_fd(&self) -> rustix::fd::BorrowedFd<'_> {
+        use rustix::fd::AsFd;
+        self.fd.as_fd()
+    }
+
+    /// Duplicate the retained descriptor, keeping the same bound root.
+    pub fn try_clone(&self) -> Result<BoundDir, BoundError> {
+        let fd = self.fd.try_clone().map_err(BoundError::Io)?;
+        Ok(BoundDir {
+            root: self.root.clone(),
+            fd,
+        })
+    }
+
+    /// The true filesystem path of the retained descriptor, if the platform
+    /// can report it. Used to resolve symlink targets against the directory
+    /// they actually live in (never a re-resolved pathname).
+    pub fn true_path(&self) -> Option<PathBuf> {
+        use rustix::fd::AsFd;
+        fd_true_path(self.fd.as_fd())
+    }
+
+    /// Split a root-relative path into components, rejecting anything that
+    /// could address outside the root lexically (absolute paths, `.`, `..`,
+    /// empty paths, NUL bytes).
+    fn split_rel(&self, rel: &Path) -> Result<Vec<std::ffi::OsString>, BoundError> {
+        if rel.is_absolute() {
+            return Err(BoundError::Outside);
+        }
+        let mut out = Vec::new();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(name) => out.push(name.to_os_string()),
+                // `.` is harmless but pointless; `..`, prefixes and roots
+                // are escapes by construction.
+                _ => return Err(BoundError::Outside),
+            }
+        }
+        if out.is_empty() {
+            return Err(BoundError::Outside);
+        }
+        Ok(out)
+    }
+
+    /// Open the directory `rel` (relative, possibly nested) under this root,
+    /// refusing to traverse symlinks. Returns a new bound directory.
+    pub fn open_dir(&self, rel: &Path) -> Result<BoundDir, BoundError> {
+        use rustix::fd::AsFd;
+        let comps = self.split_rel(rel)?;
+        let mut fd = self.fd.try_clone().map_err(BoundError::Io)?;
+        for comp in comps {
+            fd = open_child_dir(fd.as_fd(), comp.as_os_str())?;
+        }
+        // Verify the final descriptor really is a directory.
+        let stat = rustix::fs::fstat(fd.as_fd()).map_err(|_| BoundError::Unresolvable)?;
+        if (stat.st_mode as u32 & S_IFMT) != S_IFDIR {
+            return Err(BoundError::Unresolvable);
+        }
+        let root = self.root.join(rel);
+        Ok(BoundDir { root, fd })
+    }
+
+    /// Descend `rel` following symlinks, verifying every level.
+    ///
+    /// Each component is opened (following a trailing link, if any) and the
+    /// resulting descriptor's true path must stay inside the root before
+    /// descending further. This preserves the historical behavior of
+    /// traversing in-root links, but race-free: every step is verified on the
+    /// open descriptor, never on a pathname that could be re-resolved.
+    pub fn descend_verified(&self, rel: &Path) -> Result<BoundDir, BoundError> {
+        use rustix::fd::AsFd;
+        let comps = self.split_rel(rel)?;
+        let mut fd = self.fd.try_clone().map_err(BoundError::Io)?;
+        for comp in comps {
+            let child = rustix::fs::openat(
+                fd.as_fd(),
+                Path::new(&comp),
+                rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+            let true_path = fd_true_path(child.as_fd()).ok_or(BoundError::Outside)?;
+            if !true_path.starts_with(&self.root) {
+                return Err(BoundError::Outside);
+            }
+            let stat = rustix::fs::fstat(child.as_fd()).map_err(|_| BoundError::Unresolvable)?;
+            if (stat.st_mode as u32 & S_IFMT) != S_IFDIR {
+                return Err(BoundError::Unresolvable);
+            }
+            fd = child;
+        }
+        let root = self.root.join(rel);
+        Ok(BoundDir { root, fd })
+    }
+
+    /// Split a bound-relative path into its parent directory and leaf name.
+    ///
+    /// An empty `rel` (the root itself) yields a duplicate of this directory
+    /// and no leaf.
+    pub fn split_parent(
         &self,
-        path: impl AsRef<Path>,
-    ) -> Result<std::fs::File, SandboxError> {
-        use std::os::unix::io::AsRawFd;
-        let path = path.as_ref();
-        for root in &self.roots {
-            let root_file = match std::fs::File::open(root) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let rel: PathBuf = if path.is_absolute() {
-                if let Ok(stripped) = path.strip_prefix(root) {
-                    if stripped.as_os_str().is_empty() {
-                        PathBuf::from(".")
-                    } else {
-                        stripped.to_path_buf()
-                    }
-                } else {
-                    continue;
-                }
-            } else {
-                path.to_path_buf()
-            };
-            let root_fd = root_file.as_raw_fd();
-            if let Ok(file) = openat2_open_file(root_fd, &rel) {
-                return Ok(file);
+        rel: &Path,
+    ) -> Result<(BoundDir, Option<std::ffi::OsString>), BoundError> {
+        if rel.as_os_str().is_empty() {
+            let fd = self.fd.try_clone().map_err(BoundError::Io)?;
+            return Ok((
+                BoundDir {
+                    root: self.root.clone(),
+                    fd,
+                },
+                None,
+            ));
+        }
+        let comps = self.split_rel(rel)?;
+        let leaf = comps.last().cloned().expect("non-empty");
+        let parent_rel: PathBuf = comps[..comps.len() - 1].iter().collect();
+        let parent = if parent_rel.as_os_str().is_empty() {
+            let fd = self.fd.try_clone().map_err(BoundError::Io)?;
+            BoundDir {
+                root: self.root.clone(),
+                fd,
+            }
+        } else {
+            self.descend_verified(&parent_rel)?
+        };
+        Ok((parent, Some(leaf)))
+    }
+
+    /// Open the file `leaf` (single component) inside this directory without
+    /// following a trailing symlink. Used for create targets and for reads
+    /// where links must not be traversed.
+    pub fn open_file_nofollow(
+        &self,
+        leaf: &std::ffi::OsStr,
+        oflags: rustix::fs::OFlags,
+        mode: rustix::fs::Mode,
+    ) -> Result<rustix::fd::OwnedFd, BoundError> {
+        use rustix::fd::AsFd;
+        check_leaf(leaf)?;
+        let leaf_path = Path::new(leaf);
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{openat2, ResolveFlags};
+            let resolve =
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+            match openat2(
+                self.fd.as_fd(),
+                leaf_path,
+                oflags | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+                mode,
+                resolve,
+            ) {
+                Ok(fd) => return Ok(fd),
+                Err(rustix::io::Errno::NOSYS) => { /* fall through to openat */ }
+                Err(e) => return Err(map_open_error(e)),
             }
         }
-        // Fallback to check-then-open for old kernels
-        let canonical = self.resolve_existing(path)?;
-        std::fs::File::open(canonical).map_err(|_| SandboxError::Unresolvable)
+        rustix::fs::openat(
+            self.fd.as_fd(),
+            leaf_path,
+            oflags | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            mode,
+        )
+        .map_err(map_open_error)
+    }
+
+    /// Open `leaf` following a trailing symlink, then report the descriptor's
+    /// true path and require it inside the root. The returned file is immune
+    /// to later swaps: verification applies to the open descriptor, not to a
+    /// pathname that could be re-resolved.
+    pub fn open_file_verified(
+        &self,
+        leaf: &std::ffi::OsStr,
+        oflags: rustix::fs::OFlags,
+    ) -> Result<(rustix::fd::OwnedFd, PathBuf), BoundError> {
+        use rustix::fd::AsFd;
+        check_leaf(leaf)?;
+        let fd = rustix::fs::openat(
+            self.fd.as_fd(),
+            Path::new(leaf),
+            oflags | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(map_open_error)?;
+        let true_path = fd_true_path(fd.as_fd()).ok_or(BoundError::Outside)?;
+        if !true_path.starts_with(&self.root) {
+            return Err(BoundError::Outside);
+        }
+        Ok((fd, true_path))
+    }
+
+    /// Create the directory `leaf` inside this directory.
+    pub fn mkdir(&self, leaf: &std::ffi::OsStr) -> Result<(), BoundError> {
+        use rustix::fd::AsFd;
+        check_leaf(leaf)?;
+        match rustix::fs::mkdirat(
+            self.fd.as_fd(),
+            Path::new(leaf),
+            rustix::fs::Mode::from_bits_truncate(0o755),
+        ) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::EXIST) => {
+                // Already there: only acceptable for a real directory.
+                let _ = open_child_dir(self.fd.as_fd(), leaf)?;
+                Ok(())
+            }
+            Err(e) => Err(map_open_error(e)),
+        }
+    }
+
+    /// Remove the non-directory `leaf` without following it.
+    pub fn unlink_file(&self, leaf: &std::ffi::OsStr) -> Result<(), BoundError> {
+        use rustix::fd::AsFd;
+        use rustix::fs::AtFlags;
+        check_leaf(leaf)?;
+        // Never follow the leaf: unlinkat removes the link itself, and the
+        // type check below refuses directories before we touch anything.
+        let stat = rustix::fs::statat(self.fd.as_fd(), Path::new(leaf), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(map_open_error)?;
+        if (stat.st_mode as u32 & S_IFMT) == S_IFDIR {
+            return Err(BoundError::Io(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "is a directory",
+            )));
+        }
+        rustix::fs::unlinkat(self.fd.as_fd(), Path::new(leaf), AtFlags::empty())
+            .map_err(|e| BoundError::Io(e.into()))
+    }
+
+    /// Remove the empty directory `leaf`.
+    pub fn unlink_dir(&self, leaf: &std::ffi::OsStr) -> Result<(), BoundError> {
+        use rustix::fd::AsFd;
+        use rustix::fs::AtFlags;
+        check_leaf(leaf)?;
+        rustix::fs::unlinkat(self.fd.as_fd(), Path::new(leaf), AtFlags::REMOVEDIR)
+            .map_err(|e| BoundError::Io(e.into()))
+    }
+
+    /// Rename `src_leaf` in `self` to `dst_leaf` in `dst_parent`.
+    ///
+    /// Both parents are retained descriptors, so intermediate swaps cannot
+    /// redirect either end. A trailing symlink at either end is replaced, not
+    /// followed (`renameat` never traverses the final component); callers
+    /// that forbid replacing links must check first (see `stat_leaf`).
+    pub fn rename(
+        &self,
+        src_leaf: &std::ffi::OsStr,
+        dst_parent: &BoundDir,
+        dst_leaf: &std::ffi::OsStr,
+    ) -> Result<(), BoundError> {
+        use rustix::fd::AsFd;
+        check_leaf(src_leaf)?;
+        check_leaf(dst_leaf)?;
+        rustix::fs::renameat(
+            self.fd.as_fd(),
+            Path::new(src_leaf),
+            dst_parent.fd.as_fd(),
+            Path::new(dst_leaf),
+        )
+        .map_err(|e| BoundError::Io(e.into()))
+    }
+
+    /// Metadata for `leaf` without following a trailing symlink.
+    pub fn stat_leaf(&self, leaf: &std::ffi::OsStr) -> Result<rustix::fs::Stat, BoundError> {
+        use rustix::fd::AsFd;
+        use rustix::fs::AtFlags;
+        check_leaf(leaf)?;
+        rustix::fs::statat(self.fd.as_fd(), Path::new(leaf), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(map_open_error)
+    }
+
+    /// Iterate this directory's entries. Names come from the open descriptor,
+    /// so a swapped directory cannot inject entries from elsewhere.
+    pub fn read_dir(&self) -> Result<rustix::fs::Dir, BoundError> {
+        use rustix::fd::AsFd;
+        rustix::fs::Dir::read_from(self.fd.as_fd()).map_err(|e| BoundError::Io(e.into()))
     }
 }
 
-#[cfg(target_os = "linux")]
-fn openat2_resolve(root_fd: i32, path: &Path) -> Result<PathBuf, SandboxError> {
-    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
-    use std::os::fd::{AsRawFd, BorrowedFd};
-
-    let dirfd = unsafe { BorrowedFd::borrow_raw(root_fd) };
-    let flags = OFlags::PATH | OFlags::CLOEXEC;
-    let resolve = ResolveFlags::BENEATH;
-
-    if let Ok(file) = openat2(&dirfd, path, flags, Mode::empty(), resolve) {
-        let fd = file.as_raw_fd();
-        let proc_path = format!("/proc/self/fd/{fd}");
-        if let Ok(p) = std::fs::read_link(&proc_path) {
-            return Ok(p);
-        }
-        return Err(SandboxError::Outside);
+/// A leaf name must be a single normal component: no separators, no `.`/`..`,
+/// nothing empty, no interior NUL (the kernel would reject it with `EINVAL`,
+/// but failing here keeps the error a containment error, not an I/O one).
+fn check_leaf(leaf: &std::ffi::OsStr) -> Result<(), BoundError> {
+    use std::os::unix::ffi::OsStrExt;
+    if leaf.as_bytes().contains(&0) {
+        return Err(BoundError::Outside);
     }
-    Err(SandboxError::Outside)
+    let p = Path::new(leaf);
+    let mut comps = p.components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(BoundError::Outside),
+    }
 }
 
-#[cfg(target_os = "linux")]
-fn openat2_open_file(root_fd: i32, path: &Path) -> Result<std::fs::File, SandboxError> {
-    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
-    use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd};
-
-    let dirfd = unsafe { BorrowedFd::borrow_raw(root_fd) };
-    let flags = OFlags::RDONLY | OFlags::CLOEXEC;
-    let resolve = ResolveFlags::BENEATH;
-
-    match openat2(&dirfd, path, flags, Mode::empty(), resolve) {
-        Ok(file) => {
-            // rustix returns its own OwnedFd; convert to std's so it can
-            // become a std::fs::File. SAFETY: we own the fd.
-            let owned_std: std::os::fd::OwnedFd = file.into();
-            let std_file = unsafe { std::fs::File::from_raw_fd(owned_std.into_raw_fd()) };
-            Ok(std_file)
-        }
-        Err(e) => {
-            // Map rustix errors to SandboxError. openat2 with RESOLVE_BENEATH
-            // reports XDEV (and usually PERM/ACCESS) when the resolved path
-            // would escape the root.
-            match e {
-                rustix::io::Errno::NOENT => Err(SandboxError::Unresolvable),
-                rustix::io::Errno::PERM | rustix::io::Errno::ACCESS | rustix::io::Errno::XDEV => {
-                    Err(SandboxError::Outside)
-                }
-                _ => Err(SandboxError::Outside),
-            }
+/// Open one child directory without following symlinks.
+fn open_child_dir(
+    parent: impl rustix::fd::AsFd,
+    name: &std::ffi::OsStr,
+) -> Result<rustix::fd::OwnedFd, BoundError> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{openat2, ResolveFlags};
+        let resolve =
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+        match openat2(
+            parent,
+            Path::new(name),
+            rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            resolve,
+        ) {
+            Ok(fd) => return Ok(fd),
+            Err(rustix::io::Errno::NOSYS) => { /* fall through to openat */ }
+            Err(e) => return Err(map_open_error(e)),
         }
     }
+    rustix::fs::openat(
+        parent,
+        Path::new(name),
+        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(map_open_error)
+}
+
+/// The true filesystem path of an open descriptor: `/proc/self/fd` on Linux,
+/// `fcntl(F_GETPATH)` elsewhere. Used to verify an opened file (which followed
+/// a trailing symlink) really landed inside the bound root.
+fn fd_true_path(fd: impl rustix::fd::AsFd) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let link = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+        std::fs::read_link(link).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Apple platforms expose the true path of an open descriptor via
+        // fcntl(F_GETPATH). Elsewhere there is no portable equivalent, so
+        // verified opens are unsupported there (callers fail closed).
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            rustix::fs::getpath(fd)
+                .ok()
+                .map(|c| PathBuf::from(std::ffi::OsString::from_vec(c.into_bytes())))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = fd;
+            None
+        }
+    }
+}
+
+/// Map open-family errno values onto bound errors: missing components and
+/// symlink/permission rejections are containment-relevant; the rest is I/O.
+fn map_open_error(e: rustix::io::Errno) -> BoundError {
+    use rustix::io::Errno;
+    match e {
+        Errno::NOENT | Errno::NOTDIR => BoundError::Unresolvable,
+        Errno::LOOP | Errno::PERM | Errno::ACCESS | Errno::XDEV => BoundError::Outside,
+        _ => BoundError::Io(e.into()),
+    }
+}
+
+/// `bind` failures on the root open itself use the same mapping.
+fn map_outside(e: rustix::io::Errno) -> BoundError {
+    map_open_error(e)
 }
 
 #[cfg(test)]
@@ -510,5 +901,125 @@ mod tests {
     fn the_root_itself_is_inside_itself() {
         let f = Fixture::new("root_self");
         assert!(f.sandbox().resolve_existing(f.path("safe")).is_ok());
+    }
+
+    // ── BoundDir (M2-003): deterministic unit tests ──────────
+    // No races here: pre-placed links and fixed layouts pin the contract
+    // (the race itself is covered by tests/toctou.rs).
+
+    fn bound(f: &Fixture) -> BoundDir {
+        BoundDir::bind(&f.path("safe")).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn symlink(dir: &std::path::Path, name: &str, target: &std::path::Path) {
+        std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+    }
+
+    #[test]
+    fn bind_rejects_files_and_missing_roots() {
+        let f = Fixture::new("bound-roots");
+        std::fs::write(f.path("safe/file.txt"), "x").unwrap();
+        assert!(matches!(
+            BoundDir::bind(&f.path("safe/file.txt")),
+            Err(BoundError::Unresolvable)
+        ));
+        assert!(matches!(
+            BoundDir::bind(&f.path("nope")),
+            Err(BoundError::Unresolvable)
+        ));
+        assert!(BoundDir::bind(&f.path("safe")).is_ok());
+    }
+
+    #[test]
+    fn leaf_names_cannot_escape() {
+        for bad in ["", ".", "..", "/", "/abs", "a/b", "a\u{0}b"] {
+            assert!(
+                check_leaf(std::ffi::OsStr::new(bad)).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(check_leaf(std::ffi::OsStr::new("ok.txt")).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn intermediate_symlinks_are_never_traversed() {
+        let f = Fixture::new("bound-nofollow");
+        std::fs::create_dir_all(f.path("safe/real")).unwrap();
+        std::fs::write(f.path("safe/real/f.txt"), "x").unwrap();
+        std::fs::create_dir_all(f.path("elsewhere")).unwrap();
+        symlink(&f.path("safe"), "link", &f.path("elsewhere"));
+        let b = bound(&f);
+        // Traversal through the link fails even though the target exists.
+        assert!(matches!(
+            b.open_dir(std::path::Path::new("link")),
+            Err(BoundError::Outside) | Err(BoundError::Unresolvable)
+        ));
+        // The real directory still opens.
+        assert!(b.open_dir(std::path::Path::new("real")).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_open_allows_inside_links_and_denies_escaping_ones() {
+        use rustix::fs::OFlags;
+        let f = Fixture::new("bound-verify");
+        std::fs::write(f.path("safe/real.txt"), "x").unwrap();
+        std::fs::create_dir_all(f.path("elsewhere")).unwrap();
+        std::fs::write(f.path("elsewhere/secret.txt"), "s").unwrap();
+        symlink(&f.path("safe"), "in-link", &f.path("safe/real.txt"));
+        symlink(&f.path("safe"), "out-link", &f.path("elsewhere/secret.txt"));
+        let b = bound(&f);
+        assert!(b
+            .open_file_verified(std::ffi::OsStr::new("in-link"), OFlags::RDONLY)
+            .is_ok());
+        assert!(matches!(
+            b.open_file_verified(std::ffi::OsStr::new("out-link"), OFlags::RDONLY),
+            Err(BoundError::Outside)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nofollow_create_refuses_trailing_links() {
+        use rustix::fs::{Mode, OFlags};
+        let f = Fixture::new("bound-create");
+        std::fs::write(f.path("safe/real.txt"), "x").unwrap();
+        symlink(&f.path("safe"), "link.txt", &f.path("safe/real.txt"));
+        let b = bound(&f);
+        assert!(matches!(
+            b.open_file_nofollow(
+                std::ffi::OsStr::new("link.txt"),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+                Mode::from_bits_truncate(0o644),
+            ),
+            Err(BoundError::Outside) | Err(BoundError::Unresolvable)
+        ));
+    }
+
+    #[test]
+    fn mkdir_unlink_rename_stay_inside() {
+        use std::ffi::OsStr;
+        let f = Fixture::new("bound-mutate");
+        let b = bound(&f);
+        b.mkdir(OsStr::new("sub")).unwrap();
+        assert!(f.path("safe/sub").is_dir());
+        // Second mkdir is idempotent for real directories.
+        b.mkdir(OsStr::new("sub")).unwrap();
+        // Rename within the root works.
+        std::fs::write(f.path("safe/sub/a.txt"), "a").unwrap();
+        let sub = b.open_dir(std::path::Path::new("sub")).unwrap();
+        sub.rename(OsStr::new("a.txt"), &sub, OsStr::new("b.txt"))
+            .unwrap();
+        assert!(f.path("safe/sub/b.txt").exists());
+        // Unlink removes files; rmdir removes the emptied directory.
+        sub.unlink_file(OsStr::new("b.txt")).unwrap();
+        assert!(!f.path("safe/sub/b.txt").exists());
+        drop(sub);
+        b.unlink_dir(OsStr::new("sub")).unwrap();
+        assert!(!f.path("safe/sub").exists());
+        // Absolute and parent-qualified names never validate as leaves.
+        assert!(b.unlink_file(OsStr::new("/abs")).is_err());
     }
 }
