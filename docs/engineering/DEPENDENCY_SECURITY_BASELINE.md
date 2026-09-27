@@ -88,11 +88,15 @@ authoritative for vulnerabilities, deny for bans/licenses/sources.
 
 - Applied: rustls `0.23.43 → 0.23.45` (compatible; full matrix green).
 - Applied (WASM_TRUST_V1): wasmtime `22.0.1 → 36.0.16` — clears all 18
-  committed advisories (`cargo audit` exit 0; only 2 allowed warnings
-  remain: unmaintained fxhash, yanked chacha20, both transitive). MSRV 1.88
+  committed advisories (`cargo audit` exit 0 locally). MSRV 1.88
   preserved (wasmtime 36 rust-version 1.86). Migration diff: one trait
   signature + one cancellation guard; adversarial suite extended and green
   on both platforms.
+- Residual warnings (CI `--deny warnings` stays red on these two only):
+  `fxhash` (unmaintained) via `fxprof-processed-profile` ← wasmtime
+  (profiler never enabled); `chacha20` (yanked) via `r-efi` ← `getrandom`
+  (UEFI-target fallback, unreachable on Linux/macOS). Neither is referenced
+  by Marshall code; neither is removable compatibly. No suppression added.
 - Not suppressed: no `ignore` entries added to `deny.toml`, no audit
   exclusions.
 - Restriction lifted for `wasm` subject to the remaining notes below; the

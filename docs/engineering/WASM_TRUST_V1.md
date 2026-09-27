@@ -62,3 +62,32 @@ end-to-end numbers dominated by Cranelift compile time. Ranges across runs
 (machine load); no steady-state caching configured. Deps: 320 → 317 unique
 crates with `wasm`. No performance claim beyond: the migration does not
 regress execution, at the cost of +6 MB binary.
+
+## Advisory resolution
+
+`cargo audit` on the committed lock: exit 0, zero vulnerabilities (was:
+18). Residual: 2 allowed warnings (`fxhash` unmaintained via
+wasmtime-profiling, `chacha20` yanked via getrandom's UEFI fallback) —
+both unreachable transitives, documented in `DEPENDENCY_SECURITY_BASELINE.md`.
+CI `--deny warnings` stays red on exactly those two; no suppression added.
+
+## Performance (release, fixed hello module, 30 reps, shared desktop)
+
+| backend | p50 | p95 | mean | binary | max RSS |
+|---------|-----|-----|------|--------|---------|
+| wasmtime 22.0.1 | 9–20 ms | 31–40 ms | 12–20 ms | 10.8 MB | 6.8 MB |
+| wasmtime 36.0.16 | 1.0–3.5 ms | 2–20 ms | 1.1–6.3 ms | 16.9 MB | 7.5 MB |
+
+Each iteration builds a fresh `Engine` + compiles the module, so these are
+end-to-end numbers dominated by Cranelift compile time. Ranges across runs
+(machine load); no steady-state caching configured. Deps: 320 → 317 unique
+crates with `wasm`. No performance claim beyond: the migration does not
+regress execution, at the cost of +6 MB binary.
+
+## Retain decision
+
+Retain: the migration is minimal (1 signature + 1 guard), advisories clear,
+contract preserved, MSRV intact, and the backend serves the embedder
+sandbox use case nothing else in the tree provides. Retirement would save
+~300 dependency crates and 17 MB of binary but abandon the only in-process
+isolation primitive; not recommended without a replacement runtime.
