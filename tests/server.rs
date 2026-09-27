@@ -1975,3 +1975,65 @@ async fn concurrent_batches_cannot_cross_session_boundaries() {
         assert_eq!(body["code"], "path_not_allowed", "{body}");
     }
 }
+
+#[tokio::test]
+async fn templated_step_paths_get_the_effective_session_scope() {
+    // `{{steps}}` placeholders resolve after admission, so only execution-time
+    // enforcement can bind them. Step 0 prints an outside-session path byte
+    // for byte (printf, no trailing newline); step 1 reads it under session.
+    let ws = Workspace::new("m2-template-scope");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let yaml = format!(
+        r#"
+workspace: {}
+concurrency: 8
+filesystem:
+  writable: true
+shell:
+  timeout_ms: 5000
+  commands:
+    - program: {}
+      args: NoFlags
+    - program: /usr/bin/printf
+      args: NoFlags
+"#,
+        ws.root.display(),
+        echo_path().display(),
+    );
+    let policy = ExecutionPolicy::from_yaml(&yaml).unwrap();
+    let config = ws.config();
+    let app = server::build_router_with_cors(
+        server::build_state(
+            Arc::new(server::build_registry_from_policy(&policy).unwrap()),
+            &config,
+        ),
+        None,
+    );
+    let (_, body) = send(&app, post("/v1/sessions", json!({}))).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+    let outside = ws.path("shared.txt").to_string_lossy().into_owned();
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/sequence",
+            json!({
+                "session_id": sid,
+                "steps": [
+                    {"tool": "shell",
+                     "args": {"program": "/usr/bin/printf",
+                              "args": ["%s", outside]}},
+                    {"tool": "filesystem",
+                     "args": {"operation": "read",
+                              "path": "{{steps[0].stdout}}"}},
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcomes"][0]["success"], true);
+    let step1 = &body["outcomes"][1];
+    assert_eq!(step1["success"], false, "{step1}");
+    assert_eq!(step1["code"], "path_not_allowed", "{step1}");
+}
