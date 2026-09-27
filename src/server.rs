@@ -808,9 +808,10 @@ async fn admit_egress(state: &AppState, tool: &str, args: &serde_json::Value) ->
 }
 
 /// Session + egress admission for one item, in the order `execute` applies
-/// them. Batch and sequence resolve each item's effective session first and
-/// then call the two halves per item; `execute` and `execute_stream` call
-/// this directly so a streamed call can never skip what a single call checks.
+/// them. This is the single per-item admission implementation: `execute`
+/// and `execute_stream` call it directly, and batch/sequence call it once
+/// per item with the effective session inside `preflight_all`, so no
+/// endpoint can skip what a single call checks.
 async fn admit_item(
     state: &AppState,
     session_id: Option<&String>,
@@ -928,10 +929,7 @@ async fn preflight_all(
     }
     for r in items.iter() {
         let effective = effective_session(top_sid, r.session_id.as_ref());
-        if let Some(resp) = admit_session(state, effective, &r.tool, &r.args).await {
-            return Err(resp);
-        }
-        if let Some(resp) = admit_egress(state, &r.tool, &r.args).await {
+        if let Some(resp) = admit_item(state, effective, &r.tool, &r.args).await {
             return Err(resp);
         }
     }
