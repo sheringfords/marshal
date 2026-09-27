@@ -13,6 +13,12 @@ cache reused; no `cargo clean`.
   (including the Linux-only fd-stability test); escapes 14; stress 1;
   experiment-validation 17; wasm-lib 150. Node absent from the image (JS
   stubs covered on macOS); Python present.
+- GitHub CI on the pushed branch (run 36320557182): test ubuntu SUCCESS,
+  test macOS SUCCESS, MSRV 1.88 SUCCESS, wasm SUCCESS, docs SUCCESS,
+  container SUCCESS (image builds from the committed lockfile, refuses
+  unauthenticated bind, serves `/health`, 401s `/v1` without a token).
+  supply-chain FAILURE — solely the wasmtime advisories (rustls fix
+  confirmed live: RUSTSEC-2026-0285 absent from the CI output).
 - Cross-compile check from macOS (`--target x86_64-unknown-linux-gnu`) is
   NOT a substitute: it fails in the `ring` build script (missing
   `x86_64-linux-gnu-gcc`), an infrastructure gap, not a code defect. Native
