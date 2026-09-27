@@ -7,9 +7,9 @@ WORKDIR /src
 # the sources land, since cargo trusts mtimes.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/lib.rs \
-    && cargo build --release --bin marshalld 2>/dev/null || true
+    && cargo build --locked --release --bin marshalld 2>/dev/null || true
 COPY src ./src
-RUN touch src/lib.rs && cargo build --release --bin marshalld
+RUN touch src/lib.rs && cargo build --locked --release --bin marshalld
 
 # Runtime
 FROM debian:bookworm-slim

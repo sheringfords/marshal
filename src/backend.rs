@@ -523,7 +523,7 @@ async fn execute_wasm(
         .func_wrap(
             "wasi_snapshot_preview1",
             "proc_exit",
-            |code: i32| -> anyhow::Result<()> { anyhow::bail!("wasi_exit:{}", code) },
+            |code: i32| -> anyhow::Result<()> { anyhow::bail!("wasi_exit:{code}") },
         )
         .map_err(|e| anyhow::anyhow!("link proc_exit: {e}"))?;
 

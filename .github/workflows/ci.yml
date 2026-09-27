@@ -41,6 +41,11 @@ jobs:
 
       - run: cargo test --test stress
 
+      # Filesystem containment under an active symlink-swap adversary
+      # (M2-003). Adversarial by design: if this job goes red, a
+      # check-to-use race has come back open.
+      - run: cargo test --test toctou
+
       # The validation harness sits behind a feature; build and test it here so
       # gating it does not mean never compiling it again.
       - run: cargo test --features experiment --test validation
