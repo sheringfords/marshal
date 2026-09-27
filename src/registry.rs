@@ -42,6 +42,21 @@ struct CacheEntry {
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// A `JoinSet` that aborts its tasks when dropped.
+///
+/// A bare `JoinSet` detaches survivors on drop, leaving work running with no
+/// owner to report to. Batch handlers are cancelled on HTTP client
+/// disconnect, so the set must own task lifetimes: dropping the future that
+/// drives `join_next` aborts every item still queued or running. Permits held
+/// inside the tasks release via RAII during abort.
+struct AbortOnDrop<T: 'static>(tokio::task::JoinSet<T>);
+
+impl<T: 'static> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort_all();
+    }
+}
+
 /// The set of tools an agent may call.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -200,10 +215,25 @@ impl ToolRegistry {
     /// Each entry is `(name, args)`. Concurrency is bounded by `max_concurrency`
     /// (cap of 32 mirrors `marshalld` pool). Useful for agent batch steps like
     /// `read N files` without serial RTT.
+    ///
+    /// `workload` is the server-global semaphore sized to the configured
+    /// `concurrency` cap. Every item acquires one workload permit immediately
+    /// before validating and executing its tool and releases it when the tool
+    /// finishes; items waiting for a permit hold nothing, so the global cap
+    /// bounds actually-running workloads rather than admitted requests. The
+    /// per-batch `max_concurrency` semaphore is acquired first and bounds how
+    /// many of *this* batch's items may compete at once (fairness between one
+    /// large batch and concurrent single requests).
+    ///
+    /// Cancellation: spawned item tasks are aborted when the returned future
+    /// is dropped (e.g. HTTP client disconnect), so no task keeps running
+    /// unaccounted for. Permits are RAII guards held inside the item tasks,
+    /// hence released on success, tool error, panic and abort alike.
     pub async fn execute_batch(
         &self,
         requests: Vec<(String, Value)>,
         max_concurrency: usize,
+        workload: &Arc<tokio::sync::Semaphore>,
     ) -> Vec<Result<ToolOutcome>> {
         // Guard against OOM from huge batch
         if requests.len() > 64 {
@@ -212,34 +242,70 @@ impl ToolRegistry {
                 .map(|_| Err(anyhow::anyhow!("batch_too_large")))
                 .collect();
         }
-        use tokio::sync::Semaphore;
         let max = max_concurrency.clamp(1, 32);
-        let sem = Arc::new(Semaphore::new(max));
-        let mut handles = Vec::with_capacity(requests.len());
-        for (name, args) in requests {
-            let sem = sem.clone();
+        let local = Arc::new(tokio::sync::Semaphore::new(max));
+        let n = requests.len();
+        let mut set = tokio::task::JoinSet::new();
+        let mut slot_of = std::collections::HashMap::new();
+        for (index, (name, args)) in requests.into_iter().enumerate() {
+            let local = local.clone();
+            let workload = workload.clone();
             // Clone registry internals via Arc self? We need `self` to be Sync.
             // Since `&self` is shared, we spawn a task that holds a cloned reference
             // to the needed tool Arc.
             let tool = self.tools.get(&name).cloned();
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                if let Some(tool) = tool {
-                    tool.validate(&args).await?;
-                    tool.execute(args).await
+            let handle = set.spawn(async move {
+                // Local slot first, then global workload permit: a single global
+                // order, so waiters can never deadlock against each other.
+                // Neither guard is held while queued for the other.
+                let _slot = local.acquire_owned().await.unwrap();
+                let _work = workload.acquire_owned().await.unwrap();
+                let outcome = if let Some(tool) = tool {
+                    match tool.validate(&args).await {
+                        Ok(()) => tool.execute(args).await,
+                        Err(e) => Err(e),
+                    }
                 } else {
                     Err(anyhow::anyhow!("tool_not_found: {name}"))
-                }
-            }));
+                };
+                (index, outcome)
+            });
+            slot_of.insert(handle.id(), index);
         }
-        let mut results = Vec::with_capacity(handles.len());
-        for h in handles {
-            results.push(
-                h.await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("join_failed: {e}"))),
-            );
+        // Abort survivors if this future is dropped (client disconnect,
+        // shutdown): a bare `JoinSet` would detach them instead.
+        let mut set = AbortOnDrop(set);
+        let mut results: Vec<Option<Result<ToolOutcome>>> = (0..n).map(|_| None).collect();
+        while let Some(joined) = set.0.join_next().await {
+            match joined {
+                Ok((index, outcome)) => results[index] = Some(outcome),
+                Err(e) if e.is_cancelled() => {
+                    // Ourselves dropped mid-join; remaining tasks are aborted
+                    // by the guard. Report what never ran as cancelled.
+                    for slot in results.iter_mut().filter(|r| r.is_none()) {
+                        *slot = Some(Err(anyhow::anyhow!("cancelled")));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    // Task panicked: its permits dropped during unwind. The
+                    // task id maps back to its slot, so ordering is preserved
+                    // exactly as in the success path.
+                    let index = slot_of.get(&e.id()).copied();
+                    let slot = match index.and_then(|i| results.get_mut(i)) {
+                        Some(slot) => Some(slot),
+                        None => results.iter_mut().find(|r| r.is_none()),
+                    };
+                    if let Some(slot) = slot {
+                        *slot = Some(Err(anyhow::anyhow!("join_failed: {e}")));
+                    }
+                }
+            }
         }
         results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(anyhow::anyhow!("cancelled"))))
+            .collect()
     }
 
     /// Execute a sequence of tool calls **in order**, stopping on first error
@@ -415,6 +481,130 @@ mod tests {
         (registry, tool)
     }
 
+    /// A tool that sleeps `args["ms"]` while recording peak concurrency.
+    struct Sleeper {
+        current: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Sleeper {
+        fn name(&self) -> &str {
+            "sleeper"
+        }
+        fn description(&self) -> &str {
+            "sleeps while tracking concurrency"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn validate(&self, _args: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+            let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+            let n = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutcome::success("sleeper", json!({}), 0))
+        }
+    }
+
+    fn sleep_registry() -> (ToolRegistry, Arc<Sleeper>) {
+        let tool = Arc::new(Sleeper {
+            current: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(tool.clone());
+        (registry, tool)
+    }
+
+    fn sleep_reqs(n: usize, ms: u64) -> Vec<(String, Value)> {
+        (0..n)
+            .map(|_| ("sleeper".to_string(), json!({"ms": ms})))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batch_items_share_one_global_permit() {
+        // M2-001: workload cap 1 serializes items even with max_concurrency 32.
+        let (registry, tool) = sleep_registry();
+        let workload = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Instant::now();
+        let results = registry
+            .execute_batch(sleep_reqs(3, 200), 32, &workload)
+            .await;
+        assert_eq!(results.len(), 3);
+        for r in results {
+            assert!(r.unwrap().success);
+        }
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(tool.peak.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= Duration::from_millis(550));
+        assert_eq!(workload.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_items_run_in_parallel_up_to_both_caps() {
+        // max_concurrency and workload cap compose: peak is the minimum.
+        let (registry, tool) = sleep_registry();
+        let workload = Arc::new(tokio::sync::Semaphore::new(8));
+        let started = Instant::now();
+        let results = registry
+            .execute_batch(sleep_reqs(3, 200), 3, &workload)
+            .await;
+        assert!(results.into_iter().all(|r| r.unwrap().success));
+        assert_eq!(tool.peak.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(workload.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn dropping_batch_aborts_items_and_releases_permits() {
+        // Disconnect mid-batch: spawned tasks must not outlive the future,
+        // and every permit must come back.
+        let (registry, tool) = sleep_registry();
+        let workload = Arc::new(tokio::sync::Semaphore::new(2));
+        {
+            let fut = registry.execute_batch(sleep_reqs(4, 500), 4, &workload);
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => panic!("batch finished before the drop"),
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+            }
+            // `fut` (and its abort-on-drop task set) is dropped here.
+        }
+        // Let aborts land; tasks must stop starting new work.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(workload.available_permits(), 2);
+        let calls = tool.calls.load(Ordering::SeqCst);
+        assert!(calls < 4, "aborted batch kept executing ({calls} calls)");
+        let peak = tool.peak.load(Ordering::SeqCst);
+        assert!(peak <= 2, "workload cap exceeded ({peak})");
+    }
+
+    #[tokio::test]
+    async fn batch_errors_and_timeouts_release_permits() {
+        let (registry, _) = registry(true);
+        let workload = Arc::new(tokio::sync::Semaphore::new(2));
+        let reqs = vec![
+            ("counter".to_string(), json!({})),
+            ("nope".to_string(), json!({})),
+            ("counter".to_string(), json!({"bad": true})),
+        ];
+        let results = registry.execute_batch(reqs, 3, &workload).await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(results[2].is_err());
+        assert_eq!(workload.available_permits(), 2);
+    }
+
     #[tokio::test]
     async fn an_unknown_tool_is_an_error() {
         let (registry, _) = registry(true);
@@ -506,7 +696,8 @@ mod tests {
             ("counter".to_string(), json!({})),
             ("counter".to_string(), json!({})),
         ];
-        let results = registry.execute_batch(reqs, 2).await;
+        let workload = Arc::new(tokio::sync::Semaphore::new(8));
+        let results = registry.execute_batch(reqs, 2, &workload).await;
         assert_eq!(results.len(), 3);
         for r in results {
             assert!(r.unwrap().success);
@@ -518,7 +709,8 @@ mod tests {
     async fn batch_reports_missing_tool_as_error() {
         let (registry, _) = registry(true);
         let reqs = vec![("nope".to_string(), json!({}))];
-        let results = registry.execute_batch(reqs, 4).await;
+        let workload = Arc::new(tokio::sync::Semaphore::new(8));
+        let results = registry.execute_batch(reqs, 4, &workload).await;
         assert!(results[0].is_err());
         assert!(
             results[0]

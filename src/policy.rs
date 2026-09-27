@@ -234,9 +234,15 @@ pub struct SystemPolicy {
 
 /// Per-client request quota.
 ///
-/// The global `concurrency` cap sheds load to protect the host; it does nothing
-/// to stop one caller consuming the whole allowance. This is per client — the
-/// bearer token when there is one, the peer address otherwise.
+/// The global `concurrency` cap bounds concurrently executing workloads to
+/// protect the host; it does nothing to stop one caller consuming the whole
+/// allowance. This is per client — the bearer token when there is one, the
+/// peer address otherwise.
+///
+/// Quota contract: one token is consumed per admitted HTTP request,
+/// regardless of how many tool executions a batch or sequence runs. A batch
+/// of 64 items costs the same quota as a single execution; size the quota
+/// accordingly when batch endpoints are exposed.
 ///
 /// On by default: "no quota" is not a sensible default for a service that
 /// executes tools on request. Set `enabled: false` to turn it off.
