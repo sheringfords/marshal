@@ -8,9 +8,15 @@ cache reused; no `cargo clean`.
 
 - macOS (stable 1.90.0): lib 145, server 59 — green at `aabb9df` before changes.
 - MSRV 1.88 (`cargo +1.88 check --all-targets`): PASS, 0 errors.
-- Linux (rust:1.88-bookworm container, native gcc): initial `cargo check
-  --all-targets` FAILED with two code defects (below); full matrix rerun
-  after fixes (results in §2).
+- Linux (rust:1.88-bookworm container, native gcc, exact HEAD): fmt PASS;
+  clippy PASS (default, wasm, experiment); lib 145; server 59; toctou 5
+  (including the Linux-only fd-stability test); escapes 14; stress 1;
+  experiment-validation 17; wasm-lib 150. Node absent from the image (JS
+  stubs covered on macOS); Python present.
+- Cross-compile check from macOS (`--target x86_64-unknown-linux-gnu`) is
+  NOT a substitute: it fails in the `ring` build script (missing
+  `x86_64-linux-gnu-gcc`), an infrastructure gap, not a code defect. Native
+  container builds are the supported Linux path.
 - `cargo run --example agent_tools`: PASS. `marshalld --validate-config`: PASS.
 - Cross-compile check from macOS (`--target x86_64-unknown-linux-gnu`) is
   NOT a substitute: it fails in the `ring` build script (missing
