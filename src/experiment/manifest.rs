@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCategory {
     #[serde(alias = "repository_investigation")]
@@ -15,13 +15,8 @@ pub enum TaskCategory {
     TestFailure,
     #[serde(alias = "configuration_or_dependency")]
     Configuration,
+    #[default]
     Unknown,
-}
-
-impl Default for TaskCategory {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -190,7 +190,7 @@ impl MemoryTool {
     #[allow(dead_code)]
     async fn evict_expired(&self) {
         let mut m = self.store.write().await;
-        for (_, inner) in m.iter_mut() {
+        for inner in m.values_mut() {
             inner.retain(|_, e| {
                 if let Some(ttl) = e.ttl {
                     e.inserted.elapsed() < ttl

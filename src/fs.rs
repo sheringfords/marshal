@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tracing::debug;
 
-use crate::sandbox::{BoundDir, BoundError, Sandbox, SandboxError};
+use crate::sandbox::{stat_mode, BoundDir, BoundError, Sandbox, SandboxError};
 use crate::{sha256_hex, Tool, ToolOutcome};
 
 // POSIX file-type bits for interpreting `stat` results (see sandbox.rs).
@@ -54,7 +54,7 @@ fn std_io_error(e: rustix::io::Errno) -> std::io::Error {
 
 /// `(is_file, is_dir, len, readonly)` for the `stat` outcome summary.
 fn stat_summary(st: &rustix::fs::Stat) -> (bool, bool, u64, bool) {
-    let mode = st.st_mode as u32;
+    let mode = stat_mode(st);
     (
         mode & S_IFMT == S_IFREG,
         mode & S_IFMT == S_IFDIR,
@@ -175,7 +175,7 @@ async fn search_fd(
                     // descended (as before).
                     if let Ok((fd, _)) = dir.open_file_verified(name, rustix::fs::OFlags::RDONLY) {
                         if let Ok(st) = rustix::fs::fstat(&fd) {
-                            if st.st_mode as u32 & S_IFMT == S_IFREG {
+                            if stat_mode(&st) & S_IFMT == S_IFREG {
                                 grep_fd_stream(
                                     &fd,
                                     &display_path,
@@ -614,7 +614,7 @@ impl FileSystemTool {
             }
             // Missing: what stands in the way decides the shape.
             match current.stat_leaf(comp.as_os_str()) {
-                Ok(st) if st.st_mode as u32 & S_IFMT == S_IFDIR => {
+                Ok(st) if stat_mode(&st) & S_IFMT == S_IFDIR => {
                     current = current.descend_verified(std::path::Path::new(comp))?;
                     continue;
                 }
@@ -653,7 +653,7 @@ fn remove_dir_fd(dir: &BoundDir) -> Result<(), BoundError> {
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(map_bound_open_error)?;
-        if st.st_mode as u32 & S_IFMT == S_IFDIR {
+        if stat_mode(&st) & S_IFMT == S_IFDIR {
             let child = dir.descend_verified(Path::new(name))?;
             remove_dir_fd(&child)?;
             dir.unlink_dir(name)?;
@@ -1163,7 +1163,7 @@ impl Tool for FileSystemTool {
                 // semantic and cannot escape the pinned parent; the old
                 // behavior is recorded in the M2-003 report.
                 if let Ok(dst_st) = dst_parent.stat_leaf(dst_leaf.as_os_str()) {
-                    if dst_st.st_mode as u32 & S_IFMT == S_IFLNK {
+                    if stat_mode(&dst_st) & S_IFMT == S_IFLNK {
                         return Err(anyhow::anyhow!("path_not_allowed"));
                     }
                 }
@@ -1383,7 +1383,7 @@ impl Tool for FileSystemTool {
                 // traversed; directories are removed recursively through
                 // verified descriptors (see below), never by pathname.
                 let is_dir = match parent.stat_leaf(leaf.as_os_str()) {
-                    Ok(st) => st.st_mode as u32 & S_IFMT == S_IFDIR,
+                    Ok(st) => stat_mode(&st) & S_IFMT == S_IFDIR,
                     Err(BoundError::Outside | BoundError::Unresolvable) => {
                         return Err(anyhow::anyhow!("path_not_allowed"));
                     }
@@ -1443,7 +1443,7 @@ impl Tool for FileSystemTool {
                         bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                     if let Some(leaf) = leaf {
                         if let Ok(st) = parent.stat_leaf(leaf.as_os_str()) {
-                            if st.st_mode as u32 & S_IFMT != S_IFDIR {
+                            if stat_mode(&st) & S_IFMT != S_IFDIR {
                                 return Ok(ToolOutcome::failure(
                                     "filesystem",
                                     "not_a_directory",
@@ -1549,7 +1549,7 @@ impl Tool for FileSystemTool {
                                 AtFlags::SYMLINK_NOFOLLOW,
                             ) {
                                 Ok(st) => {
-                                    if st.st_mode as u32 & S_IFMT != S_IFLNK {
+                                    if stat_mode(&st) & S_IFMT != S_IFLNK {
                                         true
                                     } else {
                                         match exists_link_target(

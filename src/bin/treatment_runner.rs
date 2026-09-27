@@ -362,12 +362,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         // Now pack handoffs into turns: 2 handoffs per turn (mirrors baseline 2 per turn)
-        let mut turn_idx = 1;
         let mut seq_counter: usize = 0;
         let mut handoff_idx: usize = 0;
-        for chunk in handoffs.chunks(2) {
-            let turn_id = format!("turn_{}", turn_idx);
-            turn_idx += 1;
+        for (turn_idx, chunk) in (1..).zip(handoffs.chunks(2)) {
+            let turn_id = format!("turn_{turn_idx}");
             task_rec.agent_turn_started(&turn_id)?;
             for h in chunk {
                 match h {
@@ -383,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await;
                         if let Err(e) = res {
-                            eprintln!("bounded_sequence failed: {}", e);
+                            eprintln!("bounded_sequence failed: {e}");
                         }
                     }
                     Handoff::Single((tool, args)) => {
@@ -398,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await;
                         if let Err(e) = res {
-                            eprintln!("tool {} failed: {}", tool, e);
+                            eprintln!("tool {tool} failed: {e}");
                         }
                     }
                 }

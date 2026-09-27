@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
         "Experiment: {}\n\n",
         baseline_summary["experiment_id"].as_str().unwrap_or("")
     ));
-    md.push_str(&format!("- Total attempted: {}\n- Valid: {}\n- Successful: {}\n- Failed: {}\n- Partial: {}\n- Invalid: {}\n\n", total_valid, total_valid, success, failure, partial, invalid));
+    md.push_str(&format!("- Total attempted: {total_valid}\n- Valid: {total_valid}\n- Successful: {success}\n- Failed: {failure}\n- Partial: {partial}\n- Invalid: {invalid}\n\n"));
     md.push_str(&format!(
         "## Agent turns: median {:.1}, mean {:.1}, p25 {:.1}, p75 {:.1}, min {}, max {}\n",
         baseline_summary["agent_turns"]["median"]
@@ -199,8 +199,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(0.0)
     ));
     md.push_str(&format!(
-        "## Verification pass rate: {:.2} ({}/{})\n\n",
-        ver_rate, ver_pass, ver_total
+        "## Verification pass rate: {ver_rate:.2} ({ver_pass}/{ver_total})\n\n",
     ));
     md.push_str("### By category\n");
     for (k, v) in baseline_summary["by_category"].as_object().unwrap() {
@@ -224,7 +223,7 @@ fn main() -> anyhow::Result<()> {
     }
     md.push_str("\n### Tool distribution\n");
     for (k, v) in baseline_summary["tool_distribution"].as_object().unwrap() {
-        md.push_str(&format!("- {}: {}\n", k, v));
+        md.push_str(&format!("- {k}: {v}\n"));
     }
     std::fs::write(Path::new(&out_dir).join("baseline-summary.md"), md)?;
 
@@ -275,19 +274,19 @@ fn main() -> anyhow::Result<()> {
     }
     pmd.push_str("\n## Volume dominance\n");
     for (k, v) in &vol {
-        pmd.push_str(&format!("- {}: {}\n", k, v));
+        pmd.push_str(&format!("- {k}: {v}\n"));
     }
     pmd.push_str("\n## Duration dominance (ms total)\n");
     for (k, v) in &dur {
-        pmd.push_str(&format!("- {}: {}\n", k, v));
+        pmd.push_str(&format!("- {k}: {v}\n"));
     }
     pmd.push_str("\n## Success after op\n");
     for (k, (s, f)) in &suc {
-        pmd.push_str(&format!("- {}: success {}, failure {}\n", k, s, f));
+        pmd.push_str(&format!("- {k}: success {s}, failure {f}\n"));
     }
     std::fs::write(Path::new(&out_dir).join("pattern-analysis.md"), pmd)?;
 
-    println!("wrote baseline-summary and pattern-analysis to {}", out_dir);
+    println!("wrote baseline-summary and pattern-analysis to {out_dir}");
     Ok(())
 }
 

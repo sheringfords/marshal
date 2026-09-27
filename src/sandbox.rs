@@ -237,6 +237,26 @@ impl Sandbox {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn openat2_resolve(root_fd: i32, path: &Path) -> Result<PathBuf, SandboxError> {
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    let dirfd = unsafe { BorrowedFd::borrow_raw(root_fd) };
+    let flags = OFlags::PATH | OFlags::CLOEXEC;
+    let resolve = ResolveFlags::BENEATH;
+
+    if let Ok(file) = openat2(dirfd, path, flags, Mode::empty(), resolve) {
+        let fd = file.as_raw_fd();
+        let proc_path = format!("/proc/self/fd/{fd}");
+        if let Ok(p) = std::fs::read_link(&proc_path) {
+            return Ok(p);
+        }
+        return Err(SandboxError::Outside);
+    }
+    Err(SandboxError::Outside)
+}
+
 // Descriptor-retained containment (M2-003).
 //
 // [`Sandbox::resolve_*`] answers "is this path inside?" and hands back a
@@ -273,6 +293,16 @@ impl Sandbox {
 // re-export S_IFMT/S_IFDIR at this path).
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
+
+/// Mode bits as `u32` on every platform.
+///
+/// `Stat::st_mode` is `u32` on Linux but narrower elsewhere, so a bare
+/// `as u32` is redundant on one platform and required on the other. The
+/// single allow lives here instead of at every use site.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn stat_mode(&st: &rustix::fs::Stat) -> u32 {
+    st.st_mode as u32
+}
 
 /// What a descriptor-retained operation can report.
 #[derive(Debug)]
@@ -398,7 +428,7 @@ impl BoundDir {
         }
         // Verify the final descriptor really is a directory.
         let stat = rustix::fs::fstat(fd.as_fd()).map_err(|_| BoundError::Unresolvable)?;
-        if (stat.st_mode as u32 & S_IFMT) != S_IFDIR {
+        if (stat_mode(&stat) & S_IFMT) != S_IFDIR {
             return Err(BoundError::Unresolvable);
         }
         let root = self.root.join(rel);
@@ -429,7 +459,7 @@ impl BoundDir {
                 return Err(BoundError::Outside);
             }
             let stat = rustix::fs::fstat(child.as_fd()).map_err(|_| BoundError::Unresolvable)?;
-            if (stat.st_mode as u32 & S_IFMT) != S_IFDIR {
+            if (stat_mode(&stat) & S_IFMT) != S_IFDIR {
                 return Err(BoundError::Unresolvable);
             }
             fd = child;
@@ -562,7 +592,7 @@ impl BoundDir {
         // type check below refuses directories before we touch anything.
         let stat = rustix::fs::statat(self.fd.as_fd(), Path::new(leaf), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(map_open_error)?;
-        if (stat.st_mode as u32 & S_IFMT) == S_IFDIR {
+        if (stat_mode(&stat) & S_IFMT) == S_IFDIR {
             return Err(BoundError::Io(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "is a directory",
@@ -640,7 +670,7 @@ fn check_leaf(leaf: &std::ffi::OsStr) -> Result<(), BoundError> {
 
 /// Open one child directory without following symlinks.
 fn open_child_dir(
-    parent: impl rustix::fd::AsFd,
+    parent: rustix::fd::BorrowedFd<'_>,
     name: &std::ffi::OsStr,
 ) -> Result<rustix::fd::OwnedFd, BoundError> {
     #[cfg(target_os = "linux")]

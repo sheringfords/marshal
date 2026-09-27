@@ -107,13 +107,12 @@ fn main() -> anyhow::Result<()> {
     };
     println!("\n--- aggregate ({} tasks) ---", metrics.len());
     println!(
-        "total_turns {} total_calls {} avg_calls_per_task {:.2}",
-        total_turns, total_calls, avg_calls
+        "total_turns {total_turns} total_calls {total_calls} avg_calls_per_task {avg_calls:.2}"
     );
     if metrics.iter().any(|m| m.input_tokens.is_some()) {
         let total_in: u64 = metrics.iter().filter_map(|m| m.input_tokens).sum();
         let total_out: u64 = metrics.iter().filter_map(|m| m.output_tokens).sum();
-        println!("total_known tokens in {} out {}", total_in, total_out);
+        println!("total_known tokens in {total_in} out {total_out}");
     }
 
     if args.json {
@@ -121,7 +120,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(out) = args.out {
             std::fs::write(out, json)?;
         } else {
-            println!("{}", json);
+            println!("{json}");
         }
     } else if let Some(out) = args.out {
         let json = serde_json::to_string_pretty(&metrics)?;
