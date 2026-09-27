@@ -509,10 +509,10 @@ async fn create_session(
         created: Instant::now(),
     };
 
-    // Register per-session filesystem tool dynamically? For P2 we keep global
-    // registry + validate session root manually. Full per-session registry is
-    // Phase 3 (requires registry interior mutability). For now we just track
-    // session and let callers pass absolute path inside session root.
+    // The global registry stays shared: session binding travels with each
+    // request instead. Admission checks paths against the session sandbox,
+    // the server injects the trusted session root into filesystem args, and
+    // the tool enforces it at execution time (M2-002).
 
     state.sessions.lock().await.insert(id.clone(), session);
 
@@ -545,26 +545,64 @@ async fn egress_allowed_hosts(state: &AppState) -> Vec<String> {
         .collect()
 }
 
-fn check_session_path(sess: &Session, args: &serde_json::Value) -> Option<Response> {
-    for key in ["path", "destination"] {
-        if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
-            let path = Path::new(p);
-            // Must be inside session root (absolute check). Relative paths are also denied to enforce session isolation.
-            if !path.starts_with(&sess.root) {
-                // Allow also normalized path that equals root
-                if path != sess.root.as_path() {
-                    return Some(
-                        (
-                            StatusCode::FORBIDDEN,
-                            Json(ErrorResponse {
-                                error: "path_not_allowed: outside session".into(),
-                                code: "path_not_allowed".into(),
-                            }),
-                        )
-                            .into_response(),
-                    );
-                }
-            }
+/// Reserved filesystem arg carrying the trusted effective session root.
+///
+/// Lifecycle: stripped from every incoming execution request *before*
+/// admission (a caller can never forge it), then re-injected from server-side
+/// session state *after* admission for `filesystem` items that run under a
+/// session. `FileSystemTool` requires every resolved path to stay inside this
+/// root at execution time — which also covers `{{steps}}`-templated paths
+/// that only resolve after admission, and any future registry caller that
+/// skips HTTP admission.
+pub const SESSION_SCOPE_KEY: &str = "__session_root";
+
+fn path_not_allowed() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: "path_not_allowed: outside session".into(),
+            code: "path_not_allowed".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// Remove a caller-supplied scope key, if any. The server is the sole source
+/// of session roots; anything the caller sends is untrusted.
+fn strip_scope_key(args: &mut serde_json::Value) {
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove(SESSION_SCOPE_KEY);
+    }
+}
+
+/// Canonical session-path check for one (`tool`, `args`) pair.
+///
+/// Every `path`/`destination` string — plus the shell `working_dir` — must
+/// resolve inside the session sandbox. Resolution goes through the session's
+/// own [`Sandbox`], so `..` segments and symlinks are judged on where they
+/// *land*, not on how they are spelled (the previous lexical prefix check
+/// admitted `<root>/../shared.txt`). Values containing `{{` are step-output
+/// templates that only resolve at execution time; admission skips them and
+/// the tool-level scope check enforces the resolved value instead.
+fn check_session_path(sess: &Session, tool: &str, args: &serde_json::Value) -> Option<Response> {
+    let mut keys = vec!["path", "destination"];
+    if tool == "shell" {
+        keys.push("working_dir");
+    }
+    for key in keys {
+        let Some(p) = args.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if p.contains("{{") {
+            continue;
+        }
+        let denied = sess
+            .sandbox
+            .resolve_existing(p)
+            .or_else(|_| sess.sandbox.resolve_for_create(p))
+            .is_err();
+        if denied {
+            return Some(path_not_allowed());
         }
     }
     None
@@ -676,13 +714,14 @@ fn session_expired(sid: &str) -> Response {
         .into_response()
 }
 
-/// Session admission for one (`session_id`, `args`) pair: purge, lookup,
-/// expiry, then the session-root path check. `None` admitted the call —
-/// including when no session was named, which keeps the default-workspace
-/// behaviour of every endpoint.
+/// Session admission for one (`session_id`, `tool`, `args`) item: purge,
+/// lookup, expiry, then the canonical session-root path check. `None` admits
+/// the call — including when no session was named, which keeps the
+/// default-workspace behaviour of every endpoint.
 async fn admit_session(
     state: &AppState,
     session_id: Option<&String>,
+    tool: &str,
     args: &serde_json::Value,
 ) -> Option<Response> {
     let sid = session_id?;
@@ -691,13 +730,28 @@ async fn admit_session(
     let sessions = state.sessions.lock().await;
     match sessions.get(sid) {
         Some(sess) if sess.is_expired(state.session_ttl) => Some(session_expired(sid)),
-        Some(sess) => check_session_path(sess, args),
+        Some(sess) => check_session_path(sess, tool, args),
         None => Some(session_not_found(sid)),
     }
 }
 
-/// Existence-only session check, for the per-step overrides on endpoints whose
-/// contract scopes paths to the top-level session (see `execute_sequence`).
+/// Trusted canonical root for a live session, for tool-level scope binding.
+///
+/// Returns `None` for expired or unknown sessions (fail closed at injection
+/// time, even if the session lapsed between admission and execution).
+async fn session_scope_root(state: &AppState, session_id: &str) -> Option<PathBuf> {
+    purge_expired_sessions(state).await;
+    let sessions = state.sessions.lock().await;
+    let sess = sessions.get(session_id)?;
+    if sess.is_expired(state.session_ttl) {
+        return None;
+    }
+    sess.sandbox.roots().first().cloned()
+}
+
+/// Existence-only session check, for top-level session requirements: the
+/// session must name a live session, while per-item paths are scoped to each
+/// item's effective session (see `effective_session`).
 async fn require_session(state: &AppState, session_id: &str) -> Option<Response> {
     purge_expired_sessions(state).await;
     let sessions = state.sessions.lock().await;
@@ -762,8 +816,8 @@ async fn admit_egress(state: &AppState, tool: &str, args: &serde_json::Value) ->
 }
 
 /// Session + egress admission for one item, in the order `execute` applies
-/// them. Batch and sequence call the two halves separately where their
-/// top-level/per-step contracts differ; `execute` and `execute_stream` call
+/// them. Batch and sequence resolve each item's effective session first and
+/// then call the two halves per item; `execute` and `execute_stream` call
 /// this directly so a streamed call can never skip what a single call checks.
 async fn admit_item(
     state: &AppState,
@@ -771,7 +825,7 @@ async fn admit_item(
     tool: &str,
     args: &serde_json::Value,
 ) -> Option<Response> {
-    if let Some(resp) = admit_session(state, session_id, args).await {
+    if let Some(resp) = admit_session(state, session_id, tool, args).await {
         return Some(resp);
     }
     if let Some(resp) = admit_egress(state, tool, args).await {
@@ -780,13 +834,54 @@ async fn admit_item(
     None
 }
 
+/// Effective session for one batch/sequence item: a per-item override wins
+/// for that item, otherwise the top-level session applies, otherwise the
+/// request runs workspace-scoped. The contract is identical on batch and
+/// sequence: paths are always checked against the *effective* session.
+fn effective_session<'a>(
+    top_sid: Option<&'a String>,
+    item_sid: Option<&'a String>,
+) -> Option<&'a String> {
+    item_sid.or(top_sid)
+}
+
+/// Bind a filesystem item's args to its effective session root.
+///
+/// Looks the session up again from server-side state (fail closed when it
+/// lapsed) and writes the canonical root under [`SESSION_SCOPE_KEY`], which
+/// the tool enforces at execution time. Non-filesystem tools and
+/// session-less items are left untouched.
+async fn bind_session_scope(
+    state: &AppState,
+    session_id: Option<&String>,
+    tool: &str,
+    args: &mut serde_json::Value,
+) -> Option<Response> {
+    if tool != "filesystem" {
+        return None;
+    }
+    let sid = session_id?;
+    match session_scope_root(state, sid).await {
+        Some(root) => {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    SESSION_SCOPE_KEY.to_string(),
+                    serde_json::Value::String(root.display().to_string()),
+                );
+            }
+            None
+        }
+        None => Some(session_not_found(sid)),
+    }
+}
+
 // `headers` skipped: see `list_tools`. It carries the bearer token.
 #[tracing::instrument(skip(state, req, headers), fields(tool = %req.tool))]
 async fn execute(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<ExecuteRequest>,
+    Json(mut req): Json<ExecuteRequest>,
 ) -> Response {
     if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
@@ -798,9 +893,19 @@ async fn execute(
         Err(resp) => return resp,
     };
 
+    // A caller-supplied scope root is untrusted: drop it before admission.
+    strip_scope_key(&mut req.args);
     // Session validation: if session_id given, ensure it exists and paths are inside it.
     // Egress proxy — server-side SSRF enforcement (defense-in-depth).
     if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
+        return resp;
+    }
+    // Bind filesystem execution to the trusted session root (no-op without
+    // a session). The tool enforces this at execution time, after any
+    // template resolution admission cannot see.
+    if let Some(resp) =
+        bind_session_scope(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
+    {
         return resp;
     }
 
@@ -868,6 +973,11 @@ async fn execute_batch(
     purge_expired_sessions(&state).await;
     // Auto-scope agentic state to top-level session
     inject_session_id(&mut req.requests, &req.session_id);
+    // A caller-supplied scope root is untrusted: drop it before admission.
+    // The trusted root is bound per item after admission instead.
+    for r in &mut req.requests {
+        strip_scope_key(&mut r.args);
+    }
     // Admission control: limit batch size and concurrency to avoid OOM / fan-out.
     const MAX_BATCH: usize = 64;
     if req.requests.len() > MAX_BATCH {
@@ -902,43 +1012,33 @@ async fn execute_batch(
         )
             .into_response();
     }
-    // Session validation (top-level + per-step), then per-item egress.
-    // Each item is admitted against the top-level session when one is named
-    // (paths stay inside it) and additionally against its own per-step
-    // session override when present. The helpers hold the sessions lock only
-    // for one lookup each, so admission here cannot deadlock against itself.
+    // Session validation per item against its effective session (per-item
+    // override wins, else the top-level session), then per-item egress. A
+    // top-level session must still exist even for an empty batch: an unknown
+    // session is a 404 before any item runs. The helpers hold the sessions
+    // lock only for one lookup each, so admission here cannot deadlock
+    // against itself.
     let top_sid = req.session_id.clone();
     if let Some(sid) = &top_sid {
-        // The top-level session must exist even for an empty batch: an
-        // unknown session is a 404 before any item runs.
         if let Some(resp) = require_session(&state, sid).await {
             return resp;
         }
-        for r in &req.requests {
-            if let Some(resp) = admit_session(&state, top_sid.as_ref(), &r.args).await {
-                return resp;
-            }
-            if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
-                return resp;
-            }
-            // Per-step session override validation
-            if let Some(psid) = &r.session_id {
-                if let Some(resp) = admit_session(&state, Some(psid), &r.args).await {
-                    return resp;
-                }
-            }
+    }
+    for r in &req.requests {
+        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
+        if let Some(resp) = admit_session(&state, effective, &r.tool, &r.args).await {
+            return resp;
         }
-    } else {
-        // No top-level session, still validate per-step sessions
-        for r in &req.requests {
-            if let Some(psid) = &r.session_id {
-                if let Some(resp) = require_session(&state, psid).await {
-                    return resp;
-                }
-            }
-            if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
-                return resp;
-            }
+        if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
+            return resp;
+        }
+    }
+    // Bind every filesystem item to its effective session root. A session
+    // that lapsed between admission and binding fails closed here.
+    for r in &mut req.requests {
+        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
+        if let Some(resp) = bind_session_scope(&state, effective, &r.tool, &mut r.args).await {
+            return resp;
         }
     }
     let inner: Vec<(String, serde_json::Value)> =
@@ -985,6 +1085,10 @@ async fn execute_sequence(
     purge_expired_sessions(&state).await;
     // Auto-scope agentic state to top-level session
     inject_session_id(&mut req.steps, &req.session_id);
+    // A caller-supplied scope root is untrusted: drop it before admission.
+    for r in &mut req.steps {
+        strip_scope_key(&mut r.args);
+    }
     const MAX_STEPS: usize = 32;
     if req.steps.len() > MAX_STEPS {
         return (
@@ -1000,36 +1104,33 @@ async fn execute_sequence(
         Ok(permit) => permit,
         Err(resp) => return resp,
     };
-    // Session validation mirrors the batch contract: paths are scoped to the
-    // top-level session, and per-step overrides must at least name a live
-    // session. Egress is admitted per step afterwards, before anything runs.
+    // Session validation mirrors the batch contract: every step is admitted
+    // against its effective session (per-step override wins, else the
+    // top-level session), and a top-level session must exist even for an
+    // empty sequence. Egress is admitted per step afterwards, before anything
+    // runs.
     if let Some(sid) = &req.session_id {
-        // The top-level session must exist even for an empty sequence.
         if let Some(resp) = require_session(&state, sid).await {
             return resp;
         }
-        for r in &req.steps {
-            if let Some(resp) = admit_session(&state, Some(sid), &r.args).await {
-                return resp;
-            }
-            if let Some(psid) = &r.session_id {
-                if let Some(resp) = require_session(&state, psid).await {
-                    return resp;
-                }
-            }
-        }
-    } else {
-        for r in &req.steps {
-            if let Some(psid) = &r.session_id {
-                if let Some(resp) = require_session(&state, psid).await {
-                    return resp;
-                }
-            }
+    }
+    let top_sid = req.session_id.clone();
+    for r in &req.steps {
+        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
+        if let Some(resp) = admit_session(&state, effective, &r.tool, &r.args).await {
+            return resp;
         }
     }
     // Egress check for each step if http
     for r in &req.steps {
         if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
+            return resp;
+        }
+    }
+    // Bind every filesystem step to its effective session root, as in batch.
+    for r in &mut req.steps {
+        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
+        if let Some(resp) = bind_session_scope(&state, effective, &r.tool, &mut r.args).await {
             return resp;
         }
     }
@@ -1085,7 +1186,7 @@ async fn execute_stream(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<ExecuteRequest>,
+    Json(mut req): Json<ExecuteRequest>,
 ) -> Response {
     if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
@@ -1095,9 +1196,17 @@ async fn execute_stream(
         Ok(permit) => permit,
         Err(resp) => return resp,
     };
+    // A caller-supplied scope root is untrusted: drop it before admission.
+    strip_scope_key(&mut req.args);
     // Same session + egress admission as `execute`: a streamed call can never
     // skip what a single call checks.
     if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
+        return resp;
+    }
+    // Bind filesystem execution to the trusted session root, as in `execute`.
+    if let Some(resp) =
+        bind_session_scope(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
+    {
         return resp;
     }
 

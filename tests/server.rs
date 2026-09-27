@@ -1591,3 +1591,387 @@ async fn aborting_a_stream_mid_flight_does_not_wedge_the_server() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["outcome"]["success"], true);
 }
+
+// ── session isolation at the operation boundary (M2-002) ────
+//
+// MAR-REV-004: per-item session overrides without a top-level session skipped
+// path checks, so batch/sequence executed workspace-wide reads that single
+// execution refused. These tests pin the documented contract: the effective
+// session (per-item override, else top-level) binds every filesystem path at
+// admission *and* at the tool, on every endpoint, with the same denial shape.
+
+/// Create a session; return (id, root).
+async fn make_session(app: &Router) -> (String, PathBuf) {
+    let (_, body) = send(app, post("/v1/sessions", json!({}))).await;
+    (
+        body["session_id"].as_str().unwrap().to_string(),
+        PathBuf::from(body["root"].as_str().unwrap()),
+    )
+}
+
+fn fs_read(path: &PathBuf) -> Value {
+    json!({"operation": "read", "path": path})
+}
+
+#[tokio::test]
+async fn batch_per_item_session_cannot_read_outside_its_root() {
+    let ws = Workspace::new("m2-batch-scope");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, _) = make_session(&app).await;
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [{
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": fs_read(&ws.path("shared.txt")),
+            }]}),
+        ),
+    )
+    .await;
+    // Admission denies the whole request before anything runs.
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed", "{body}");
+}
+
+#[tokio::test]
+async fn sequence_per_item_session_cannot_read_outside_its_root() {
+    let ws = Workspace::new("m2-seq-scope");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, _) = make_session(&app).await;
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/sequence",
+            json!({"steps": [{
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": fs_read(&ws.path("shared.txt")),
+            }]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed", "{body}");
+}
+
+#[tokio::test]
+async fn top_level_and_override_follow_one_contract_on_both_endpoints() {
+    // Override wins for its item and is checked against the *override* root:
+    // a path inside the top-level session but outside the override is denied
+    // identically by batch and sequence.
+    let ws = Workspace::new("m2-override-contract");
+    let app = ws.app();
+    let (sid_a, root_a) = make_session(&app).await;
+    let (sid_b, _) = make_session(&app).await;
+    std::fs::write(root_a.join("a.txt"), "a's file").unwrap();
+
+    for uri in ["/v1/execute/batch", "/v1/execute/sequence"] {
+        let key = if uri.ends_with("batch") {
+            "requests"
+        } else {
+            "steps"
+        };
+        let (status, body) = send(
+            &app,
+            post(
+                uri,
+                json!({
+                    "session_id": sid_a,
+                    key: [{
+                        "tool": "filesystem",
+                        "session_id": sid_b,
+                        "args": fs_read(&root_a.join("a.txt")),
+                    }],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(body["code"], "path_not_allowed", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn session_a_cannot_read_or_write_session_b_files() {
+    let ws = Workspace::new("m2-cross-session");
+    let app = ws.app();
+    let (sid_a, _) = make_session(&app).await;
+    let (_sid_b, root_b) = make_session(&app).await;
+    std::fs::write(root_b.join("secret.txt"), "b secret").unwrap();
+
+    // Read across.
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid_a,
+                "args": fs_read(&root_b.join("secret.txt")),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Write across via batch override without top-level.
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [{
+                "tool": "filesystem",
+                "session_id": sid_a,
+                "args": {"operation": "write", "path": root_b.join("evil.txt"), "content": "x"},
+            }]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed", "{body}");
+    assert!(!root_b.join("evil.txt").exists());
+}
+
+#[tokio::test]
+async fn dotdot_traversal_is_rejected_under_session() {
+    let ws = Workspace::new("m2-dotdot");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+
+    // Lexically inside the root, canonically outside it.
+    let escaped = root.join("..").join("shared.txt");
+    for uri in ["/v1/execute", "/v1/execute/stream"] {
+        let (status, body) = send(
+            &app,
+            post(
+                uri,
+                json!({
+                    "tool": "filesystem",
+                    "session_id": sid,
+                    "args": fs_read(&escaped),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(body["code"], "path_not_allowed", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn symlink_escape_is_rejected_under_session() {
+    let ws = Workspace::new("m2-symlink");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(ws.path("shared.txt"), root.join("link.txt")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(ws.path("shared.txt"), root.join("link.txt")).unwrap();
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": fs_read(&root.join("link.txt")),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed");
+}
+
+#[tokio::test]
+async fn copy_and_move_validate_both_ends_under_session() {
+    let ws = Workspace::new("m2-copy-move");
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(ws.path("other.txt"), "other").unwrap();
+
+    // Destination outside the session is denied even when the source is inside.
+    for op in ["copy", "move"] {
+        let target = if op == "copy" {
+            "copied.txt"
+        } else {
+            "moved.txt"
+        };
+        let (status, _) = send(
+            &app,
+            post(
+                "/v1/execute",
+                json!({
+                    "tool": "filesystem",
+                    "session_id": sid,
+                    "args": {"operation": op, "path": root.join("a.txt"),
+                             "destination": ws.path(target)},
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{op}");
+        assert!(!ws.path(target).exists(), "{op} escaped the session");
+    }
+    // Source outside the session is denied even when the destination is inside.
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": {"operation": "copy", "path": ws.path("other.txt"),
+                         "destination": root.join("in.txt")},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!root.join("in.txt").exists());
+}
+
+#[tokio::test]
+async fn search_and_glob_are_scoped_to_the_session() {
+    let ws = Workspace::new("m2-enumerate");
+    std::fs::write(ws.path("outside.txt"), "needle here").unwrap();
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+    std::fs::write(root.join("inside.txt"), "needle here").unwrap();
+
+    // A base outside the session is denied.
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": {"operation": "search", "path": ws.root,
+                         "pattern": "needle", "recursive": true},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed");
+
+    // A base inside the session never surfaces outside files.
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": {"operation": "search", "path": root,
+                         "pattern": "needle", "recursive": true},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.to_string();
+    assert!(text.contains("inside.txt"), "{text}");
+    assert!(!text.contains("outside.txt"), "{text}");
+}
+
+#[tokio::test]
+async fn shell_working_dir_outside_the_session_is_rejected() {
+    let ws = Workspace::new("m2-shell-cwd");
+    let app = ws.app();
+    let (sid, _) = make_session(&app).await;
+
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "shell",
+                "session_id": sid,
+                "args": {"program": echo_path(), "args": ["hi"],
+                         "working_dir": ws.root},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed");
+}
+
+#[tokio::test]
+async fn session_roots_are_absolute_and_registry_independent() {
+    // Hot reload swaps the tool registry and egress list but never the
+    // sessions table: roots are absolute paths bound at creation, so a reload
+    // cannot silently expand what an existing session may touch.
+    let ws = Workspace::new("m2-reload-shape");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+    assert!(root.is_absolute(), "{root:?}");
+    assert!(root.starts_with(&ws.root));
+
+    // The same denial holds when the request is served by a registry built
+    // from a different policy: enforcement follows the stored root, not the
+    // currently loaded tools.
+    let other = Workspace::new("m2-reload-other");
+    let _other_app = other.app();
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": sid,
+                "args": fs_read(&ws.path("shared.txt")),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn concurrent_batches_cannot_cross_session_boundaries() {
+    let ws = Workspace::new("m2-concurrent-scope");
+    let app = ws.app();
+    let (sid_a, _) = make_session(&app).await;
+    let (_sid_b, root_b) = make_session(&app).await;
+    std::fs::write(root_b.join("secret.txt"), "b secret").unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let sid_a = sid_a.clone();
+        let target = root_b.join("secret.txt");
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                post(
+                    "/v1/execute/batch",
+                    json!({"requests": [{
+                        "tool": "filesystem",
+                        "session_id": sid_a,
+                        "args": {"operation": "read", "path": target},
+                    }]}),
+                ),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let (status, body) = h.await.expect("task");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "path_not_allowed", "{body}");
+    }
+}

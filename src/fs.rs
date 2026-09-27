@@ -70,6 +70,91 @@ impl FileSystemTool {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing 'path'"))
     }
+
+    /// Trusted session root bound by the server after admission, if any.
+    ///
+    /// The server strips caller-supplied values before admission and injects
+    /// the canonical root from its own session table, so a present value is
+    /// authoritative. Only absolute paths qualify; anything else is treated
+    /// as no scope (fail open would be wrong here only if the server lied,
+    /// and the server never sends a relative root).
+    fn scope_root(args: &Value) -> Option<std::path::PathBuf> {
+        let s = args.get(crate::server::SESSION_SCOPE_KEY)?.as_str()?;
+        let p = std::path::PathBuf::from(s);
+        p.is_absolute().then_some(p)
+    }
+
+    /// Resolve an existing path through the workspace sandbox and require it
+    /// inside the session scope when one is bound. Returned paths are
+    /// canonical, so the prefix check is component-wise.
+    fn resolve_scoped_existing(&self, args: &Value, raw: &str) -> Result<std::path::PathBuf> {
+        let resolved = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+        self.check_scope(args, &resolved)?;
+        Ok(resolved)
+    }
+
+    /// Resolve a creatable path through the workspace sandbox and require it
+    /// inside the session scope when one is bound.
+    fn resolve_scoped_for_create(&self, args: &Value, raw: &str) -> Result<std::path::PathBuf> {
+        let resolved = self.sandbox.resolve_for_create(raw).map_err(policy_error)?;
+        self.check_scope(args, &resolved)?;
+        Ok(resolved)
+    }
+
+    /// Roots that contained paths must stay inside: the session root when the
+    /// call runs under a session, otherwise the tool's sandbox roots.
+    fn effective_roots(&self, args: &Value) -> Vec<std::path::PathBuf> {
+        if let Some(scope) = Self::scope_root(args) {
+            vec![scope]
+        } else {
+            self.sandbox.roots().to_vec()
+        }
+    }
+
+    /// Require an already-resolved (canonical) path to stay inside the
+    /// effective roots. Sandbox resolution guarantees canonical form, so a
+    /// component-wise prefix check is sound here (remaining TOCTOU between
+    /// check and I/O is M2-003 territory and documented as such).
+    fn check_scope(&self, args: &Value, resolved: &std::path::Path) -> Result<()> {
+        if Self::scope_root(args).is_some()
+            && !Self::inside_roots(&self.effective_roots(args), resolved)
+        {
+            anyhow::bail!("path_not_allowed");
+        }
+        Ok(())
+    }
+
+    fn inside_roots(roots: &[std::path::PathBuf], canonical: &std::path::Path) -> bool {
+        roots.iter().any(|r| canonical.starts_with(r))
+    }
+
+    /// Scope check for paths that do not resolve (the `exists` probe).
+    ///
+    /// Walks up to the longest existing prefix, canonicalizes it, and
+    /// requires it inside the session root. A probe whose nearest existing
+    /// ancestor already escapes the session is denied rather than reported
+    /// absent, so `exists` cannot oracle session-external layout.
+    fn scope_probe(&self, args: &Value, raw: &str) -> Result<()> {
+        let Some(scope) = Self::scope_root(args) else {
+            return Ok(());
+        };
+        let mut candidate = std::path::PathBuf::from(raw);
+        loop {
+            match candidate.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(&scope) {
+                        anyhow::bail!("path_not_allowed");
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    if !candidate.pop() {
+                        anyhow::bail!("path_not_allowed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -121,17 +206,25 @@ impl Tool for FileSystemTool {
             "exists" => {
                 // Read-only probe: missing -> exists:false, outside -> policy error
                 // (so it cannot be used as an oracle for paths outside the sandbox).
+                // A session scope narrows "outside" to outside the session root.
                 match self.sandbox.resolve_existing(path) {
                     Ok(p) => {
-                        let _ = p;
+                        self.check_scope(args, &p)?;
                         Ok(())
                     }
-                    Err(SandboxError::Unresolvable) => Ok(()),
+                    Err(SandboxError::Unresolvable) => {
+                        // Missing paths reveal nothing, but a scope still
+                        // confines the probe: an unresolvable path whose
+                        // longest existing prefix escapes the session is
+                        // denied rather than reported absent.
+                        self.scope_probe(args, path)?;
+                        Ok(())
+                    }
                     Err(e) => Err(policy_error(e)),
                 }?;
             }
             "read" | "list" | "stat" | "search" | "glob" => {
-                self.sandbox.resolve_existing(path).map_err(policy_error)?;
+                let _ = self.resolve_scoped_existing(args, path)?;
                 if operation == "search" {
                     let pat = args
                         .get("pattern")
@@ -158,9 +251,7 @@ impl Tool for FileSystemTool {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                self.sandbox
-                    .resolve_for_create(path)
-                    .map_err(policy_error)?;
+                let _ = self.resolve_scoped_for_create(args, path)?;
                 let has_str = args.get("content").and_then(Value::as_str).is_some();
                 let has_b64 = args.get("content_base64").and_then(Value::as_str).is_some();
                 if !has_str && !has_b64 {
@@ -180,31 +271,27 @@ impl Tool for FileSystemTool {
                     anyhow::bail!("writes_not_permitted");
                 }
                 if operation == "delete" {
-                    self.sandbox.resolve_existing(path).map_err(policy_error)?;
+                    let _ = self.resolve_scoped_existing(args, path)?;
                 } else {
-                    self.sandbox
-                        .resolve_for_create(path)
-                        .map_err(policy_error)?;
+                    let _ = self.resolve_scoped_for_create(args, path)?;
                 }
             }
             "copy" | "move" => {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                self.sandbox.resolve_existing(path).map_err(policy_error)?;
+                let _ = self.resolve_scoped_existing(args, path)?;
                 let dest = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination' for copy/move"))?;
-                self.sandbox
-                    .resolve_for_create(dest)
-                    .map_err(policy_error)?;
+                let _ = self.resolve_scoped_for_create(args, dest)?;
             }
             "patch" => {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                self.sandbox.resolve_existing(path).map_err(policy_error)?;
+                let _ = self.resolve_scoped_existing(args, path)?;
                 let search = args
                     .get("search")
                     .and_then(Value::as_str)
@@ -238,6 +325,11 @@ impl Tool for FileSystemTool {
 
         match operation {
             "read" => {
+                // Scope is checked on the canonical path even on Linux, where
+                // I/O itself goes through an fd opened workspace-wide.
+                let _ = Self::scope_root(&args)
+                    .map(|_| self.resolve_scoped_existing(&args, raw))
+                    .transpose()?;
                 // Linux: use openat2 fd for I/O to close TOCTOU (darwin falls back to check-then-open)
                 #[cfg(target_os = "linux")]
                 let read_result = {
@@ -254,7 +346,7 @@ impl Tool for FileSystemTool {
                 };
                 #[cfg(not(target_os = "linux"))]
                 let read_result = {
-                    let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                    let path = self.resolve_scoped_existing(&args, raw)?;
                     read_file_capped(&path, self.read_limit).await
                 };
                 #[cfg(target_os = "linux")]
@@ -313,7 +405,7 @@ impl Tool for FileSystemTool {
             }
 
             "write" => {
-                let path = self.sandbox.resolve_for_create(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_for_create(&args, raw)?;
                 let bytes: Vec<u8> = if let Some(s) = args.get("content").and_then(Value::as_str) {
                     s.as_bytes().to_vec()
                 } else if let Some(b64) = args.get("content_base64").and_then(Value::as_str) {
@@ -345,7 +437,7 @@ impl Tool for FileSystemTool {
             }
 
             "mkdir" => {
-                let path = self.sandbox.resolve_for_create(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_for_create(&args, raw)?;
                 match fs::create_dir_all(&path).await {
                     Err(e) => Ok(ToolOutcome::failure(
                         "filesystem",
@@ -362,7 +454,7 @@ impl Tool for FileSystemTool {
             }
 
             "stat" => {
-                let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_existing(&args, raw)?;
                 match fs::metadata(&path).await {
                     Err(e) => Ok(ToolOutcome::failure(
                         "filesystem",
@@ -386,15 +478,12 @@ impl Tool for FileSystemTool {
             }
 
             "copy" => {
-                let src = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let src = self.resolve_scoped_existing(&args, raw)?;
                 let dest_raw = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination'"))?;
-                let dest = self
-                    .sandbox
-                    .resolve_for_create(dest_raw)
-                    .map_err(policy_error)?;
+                let dest = self.resolve_scoped_for_create(&args, dest_raw)?;
                 // ensure src and dest are not same
                 if src == dest {
                     return Ok(ToolOutcome::failure(
@@ -419,16 +508,15 @@ impl Tool for FileSystemTool {
             }
 
             "move" => {
-                let src = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let src = self.resolve_scoped_existing(&args, raw)?;
                 let dest_raw = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination'"))?;
-                let dest = self
-                    .sandbox
-                    .resolve_for_create(dest_raw)
-                    .map_err(policy_error)?;
-                if self.sandbox.roots().iter().any(|r| r == &src) {
+                let dest = self.resolve_scoped_for_create(&args, dest_raw)?;
+                if self.sandbox.roots().iter().any(|r| r == &src)
+                    || Self::scope_root(&args).as_deref() == Some(src.as_path())
+                {
                     return Ok(ToolOutcome::failure(
                         "filesystem",
                         "refused_move_root",
@@ -451,7 +539,7 @@ impl Tool for FileSystemTool {
             }
 
             "append" => {
-                let path = self.sandbox.resolve_for_create(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_for_create(&args, raw)?;
                 let bytes: Vec<u8> = if let Some(s) = args.get("content").and_then(Value::as_str) {
                     s.as_bytes().to_vec()
                 } else if let Some(b64) = args.get("content_base64").and_then(Value::as_str) {
@@ -481,7 +569,7 @@ impl Tool for FileSystemTool {
             }
 
             "search" => {
-                let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_existing(&args, raw)?;
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                 let recursive = args
                     .get("recursive")
@@ -521,26 +609,22 @@ impl Tool for FileSystemTool {
                                     if let Ok(ft) = entry.file_type().await {
                                         let p = entry.path();
                                         if ft.is_dir() && recursive {
-                                            // ensure stays inside sandbox
+                                            // ensure stays inside the effective roots
                                             if let Ok(canonical) = p.canonicalize() {
-                                                if self
-                                                    .sandbox
-                                                    .roots()
-                                                    .iter()
-                                                    .any(|r| canonical.starts_with(r))
-                                                {
+                                                if Self::inside_roots(
+                                                    &self.effective_roots(&args),
+                                                    &canonical,
+                                                ) {
                                                     stack.push(p);
                                                 }
                                             }
                                         } else if ft.is_file() {
-                                            // Ensure file itself is inside sandbox (symlink check).
+                                            // Ensure file itself is inside the effective roots (symlink check).
                                             if let Ok(canonical) = p.canonicalize() {
-                                                if !self
-                                                    .sandbox
-                                                    .roots()
-                                                    .iter()
-                                                    .any(|r| canonical.starts_with(r))
-                                                {
+                                                if !Self::inside_roots(
+                                                    &self.effective_roots(&args),
+                                                    &canonical,
+                                                ) {
                                                     continue;
                                                 }
                                             } else {
@@ -593,21 +677,16 @@ impl Tool for FileSystemTool {
             }
 
             "glob" => {
-                let base = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let base = self.resolve_scoped_existing(&args, raw)?;
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("*");
                 // Build glob pattern relative to base, e.g. base + "/" + pattern
                 let full_pattern = format!("{}/{}", base.display(), pattern);
                 let mut matches = Vec::new();
                 if let Ok(paths) = glob::glob(&full_pattern) {
                     for entry in paths.flatten() {
-                        // Must canonicalize and be inside sandbox; deny if canonical fails.
+                        // Must canonicalize and be inside the effective roots; deny if canonical fails.
                         if let Ok(canonical) = entry.canonicalize() {
-                            if self
-                                .sandbox
-                                .roots()
-                                .iter()
-                                .any(|r| canonical.starts_with(r))
-                            {
+                            if Self::inside_roots(&self.effective_roots(&args), &canonical) {
                                 matches.push(entry.display().to_string());
                             }
                         }
@@ -626,7 +705,7 @@ impl Tool for FileSystemTool {
             }
 
             "patch" => {
-                let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_existing(&args, raw)?;
                 let search = args.get("search").and_then(Value::as_str).unwrap_or("");
                 let replace = args.get("replace").and_then(Value::as_str).unwrap_or("");
                 if search.is_empty() {
@@ -673,9 +752,11 @@ impl Tool for FileSystemTool {
             }
 
             "delete" => {
-                let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
-                // refuse to delete sandbox root itself
-                if self.sandbox.roots().iter().any(|r| r == &path) {
+                let path = self.resolve_scoped_existing(&args, raw)?;
+                // refuse to delete the sandbox root — or the session root — itself
+                if self.sandbox.roots().iter().any(|r| r == &path)
+                    || Self::scope_root(&args).as_deref() == Some(path.as_path())
+                {
                     return Ok(ToolOutcome::failure(
                         "filesystem",
                         "refused_delete_root",
@@ -704,7 +785,7 @@ impl Tool for FileSystemTool {
             }
 
             "list" => {
-                let path = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
+                let path = self.resolve_scoped_existing(&args, raw)?;
                 if !path.is_dir() {
                     return Ok(ToolOutcome::failure(
                         "filesystem",
@@ -744,18 +825,24 @@ impl Tool for FileSystemTool {
             }
 
             "exists" => match self.sandbox.resolve_existing(raw) {
-                Ok(p) => Ok(ToolOutcome::success(
+                Ok(p) => {
+                    self.check_scope(&args, &p)?;
+                    Ok(ToolOutcome::success(
                     "filesystem",
                     json!({"operation": "exists", "exists": true, "path": p.display().to_string()}),
                     elapsed(started),
                 )
-                .with_metadata("operation", "exists")),
-                Err(SandboxError::Unresolvable) => Ok(ToolOutcome::success(
-                    "filesystem",
-                    json!({"operation": "exists", "exists": false}),
-                    elapsed(started),
-                )
-                .with_metadata("operation", "exists")),
+                .with_metadata("operation", "exists"))
+                }
+                Err(SandboxError::Unresolvable) => {
+                    self.scope_probe(&args, raw)?;
+                    Ok(ToolOutcome::success(
+                        "filesystem",
+                        json!({"operation": "exists", "exists": false}),
+                        elapsed(started),
+                    )
+                    .with_metadata("operation", "exists"))
+                }
                 Err(e) => Err(policy_error(e)),
             },
 
