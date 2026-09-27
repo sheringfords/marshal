@@ -595,7 +595,11 @@ fn inject_session_id(requests: &mut [ExecuteRequest], top_sid: &Option<String>) 
 // Every execution endpoint — single, batch, sequence, stream — admits work
 // through these helpers, in the same order: edge (auth, quota) → concurrency
 // → session → egress. A denial returns before any tool runs, with the same
-// status code and `code` value on every endpoint.
+// status code and `code` value on every endpoint. For single, sequence and
+// stream the concurrency step holds one workload permit for the execution;
+// batch instead checks burst capacity up front (503 when none is free) and
+// each item takes its own workload permit as it starts, so at most
+// `concurrency` tools execute at once no matter how requests are shaped.
 //
 // What is recorded: a call that executes a tool (success or failure outcome)
 // gets one audit record and one metrics observation. A call turned away at
@@ -618,11 +622,16 @@ fn admit_edge(
     None
 }
 
-/// One concurrency permit shared by every execution handler.
+/// One concurrency permit per running workload.
 ///
-/// The permit is held for the whole admitted request, so a `/v1/execute/stream`
-/// call counts against the cap exactly like the call it mirrors. The caller
-/// meters the shed load to keep `concurrency_limited` visible on every path.
+/// Single, sequence and streaming requests hold exactly one permit while they
+/// execute their (single, serial) workload, so each counts 1 against the cap.
+/// Batch requests do not take a permit here at all: every batch item acquires
+/// its own permit from the same semaphore as it starts executing (see the
+/// registry), so the cap bounds concurrently *executing* workloads rather
+/// than admitted HTTP requests. Items waiting for a permit hold nothing.
+/// The caller meters the shed load to keep `concurrency_limited` visible on
+/// every path.
 ///
 /// `Response` is large (axum's body type), so this carries an allow rather
 /// than a box: boxing would add indirection to every admitted request to
@@ -871,14 +880,28 @@ async fn execute_batch(
         )
             .into_response();
     }
-    // Acquire permits proportional to concurrency to avoid fan-out bypassing global limit.
+    // Workload admission: every batch item acquires its own permit from the
+    // global semaphore as it starts executing (see `execute_batch` in the
+    // registry), so running workloads — not admitted requests — are what the
+    // `concurrency` cap bounds. Holding one request-level permit here while
+    // items wait for workload permits would deadlock at `concurrency: 1`
+    // (the permit the items need is the one the handler holds), so the
+    // handler holds no permit across fan-out. Instead this fail-fast burst
+    // gate sheds the request when no workload capacity is currently free;
+    // admitted items then queue on the semaphore holding nothing.
+    // Queued items hold no permits; each running item holds exactly one.
     let max = req.max_concurrency.unwrap_or(8).clamp(1, 32);
-    // Try to acquire `max` permits or fail fast; simpler to acquire 1 global permit and rely on inner sem.
-    // To avoid 32x blow-up, we acquire 1 but bound max to 32 and batch size to 64.
-    let _permit = match admit_concurrency(&state) {
-        Ok(permit) => permit,
-        Err(resp) => return resp,
-    };
+    if state.semaphore.available_permits() == 0 {
+        state.metrics.observe_with_tool("", false, 0);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "too many concurrent executions".into(),
+                code: "concurrency_limited".into(),
+            }),
+        )
+            .into_response();
+    }
     // Session validation (top-level + per-step), then per-item egress.
     // Each item is admitted against the top-level session when one is named
     // (paths stay inside it) and additionally against its own per-step
@@ -922,7 +945,11 @@ async fn execute_batch(
         req.requests.into_iter().map(|r| (r.tool, r.args)).collect();
     state.metrics.inc_request();
     let registry = state.registry.read().await.clone();
-    let results = registry.execute_batch(inner, max).await;
+    // Workload permits come from the shared global semaphore: at most
+    // `concurrency` items execute at once across all requests. Dropping this
+    // future (client disconnect) aborts queued/running items via the
+    // registry's abort-on-drop set; permits release through RAII.
+    let results = registry.execute_batch(inner, max, &state.semaphore).await;
     let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
     for r in results {
         match r {
@@ -1336,7 +1363,10 @@ pub struct ServerConfig {
     pub workspace_root: PathBuf,
     /// JSONL audit log. `None` logs through `tracing` only.
     pub audit_path: Option<PathBuf>,
-    /// Global cap on in-flight executions.
+    /// Global cap on concurrently executing workloads (tool executions).
+    /// Single, sequence and streaming requests each run one workload per
+    /// permit; batch items each take their own permit as they start, so this
+    /// bounds running tools across all requests, not admitted HTTP requests.
     pub concurrency: usize,
     /// Listen port.
     pub port: u16,
@@ -1351,7 +1381,9 @@ pub struct ServerConfig {
     /// Session lifetime. `None` reads `MARSHALLD_SESSION_TTL_SECS`.
     pub session_ttl: Option<Duration>,
     /// Per-client quota. `None` disables throttling, leaving only the global
-    /// concurrency cap — which protects the host but not the other callers.
+    /// concurrency cap — which bounds running workloads to protect the host
+    /// but not the other callers' share. Quota is charged per HTTP request,
+    /// not per executed item (see `RateLimitPolicy`).
     pub rate_limit: Option<RateLimit>,
 }
 

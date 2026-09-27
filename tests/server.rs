@@ -723,6 +723,128 @@ async fn requests_over_the_concurrency_cap_are_shed() {
     assert_eq!(body["code"], "concurrency_limited");
 }
 
+// ── workload-bounded concurrency (M2-001) ────────────────────
+//
+// `concurrency` bounds concurrently *executing* workloads, not admitted HTTP
+// requests: every batch item takes its own permit as it starts. These tests
+// pin that a batch cannot fan out past the cap, that mixed traffic shares
+// one workload budget, and that aborting a batch returns its permits.
+
+fn sleep_tool(ms: u64) -> Value {
+    execute("system", json!({"operation": "sleep", "duration_ms": ms}))
+}
+
+fn batch_of_sleeps(n: usize, ms: u64, max_concurrency: usize) -> Value {
+    json!({
+        "requests": (0..n).map(|_| execute("system", json!({"operation": "sleep", "duration_ms": ms}))).collect::<Vec<_>>(),
+        "max_concurrency": max_concurrency,
+    })
+}
+
+#[tokio::test]
+async fn batch_cannot_fan_out_past_the_workload_cap() {
+    let ws = Workspace::new("batch-cap");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+
+    // Three 300 ms sleeps with max_concurrency 32 must serialize: one running
+    // workload at a time under a single permit.
+    let started = std::time::Instant::now();
+    let (status, body) = send(&app, post("/v1/execute/batch", batch_of_sleeps(3, 300, 32))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcomes"].as_array().unwrap().len(), 3);
+    for outcome in body["outcomes"].as_array().unwrap() {
+        assert_eq!(outcome["success"], true);
+    }
+    assert!(started.elapsed() >= Duration::from_millis(800));
+}
+
+#[tokio::test]
+async fn batch_holds_no_request_permit_while_items_wait() {
+    // Regression for the old shape (1 request permit per batch hiding 32
+    // children): with concurrency 1, a contender arriving mid-batch must see
+    // the workload budget as exhausted, not as one free request slot.
+    let ws = Workspace::new("batch-shed");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+
+    let slow = app
+        .clone()
+        .oneshot(post("/v1/execute/batch", batch_of_sleeps(2, 400, 8)));
+    let contender = async {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send(&app, post("/v1/execute", sleep_tool(10))).await
+    };
+
+    let (_slow, (status, body)) = tokio::join!(slow, contender);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "concurrency_limited");
+}
+
+#[tokio::test]
+async fn mixed_single_and_batch_traffic_shares_one_workload_budget() {
+    let ws = Workspace::new("mixed-budget");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 4,
+        ..ws.config()
+    });
+
+    // Occupy all four workload permits with slow singles.
+    let mut singles = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        singles.push(tokio::spawn(async move {
+            app.oneshot(post("/v1/execute", sleep_tool(500)))
+                .await
+                .expect("response")
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // A batch arriving with no free workload capacity is shed, not queued
+    // behind an unbounded wait.
+    let (status, body) = send(&app, post("/v1/execute/batch", batch_of_sleeps(2, 10, 8))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "concurrency_limited");
+    for slow in singles {
+        let response = slow.await.expect("task");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    // After the drain, the same batch is admitted and runs.
+    let (status, body) = send(&app, post("/v1/execute/batch", batch_of_sleeps(2, 10, 8))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcomes"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn aborted_batch_returns_its_workload_permits() {
+    // Dropping the batch request mid-flight (client disconnect) must abort
+    // queued/running items and release every permit: with concurrency 1, a
+    // leaked permit would turn the next request into a 503.
+    let ws = Workspace::new("batch-abort");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+
+    {
+        let fut = app
+            .clone()
+            .oneshot(post("/v1/execute/batch", batch_of_sleeps(4, 400, 4)));
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("batch finished before the abort"),
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, _) = send(&app, post("/v1/execute", sleep_tool(10))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 // ── quotas ──────────────────────────────────────────────────
 
 #[tokio::test]

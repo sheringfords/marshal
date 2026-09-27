@@ -83,6 +83,11 @@ pub async fn instrument_execute(
 }
 
 /// Batch instrumentation — emits N child events, not N+1.
+///
+/// The experiment harness has no server-global semaphore, so batch items are
+/// accounted against a dedicated per-call semaphore sized to
+/// `max_concurrency`: this preserves the harness's historical parallelism
+/// without pretending to share the daemon's workload cap.
 pub async fn instrument_batch(
     registry: &ToolRegistry,
     recorder: &TaskRecorder,
@@ -99,8 +104,9 @@ pub async fn instrument_batch(
         let ib = Some(serde_json::to_string(args).unwrap_or_default().len());
         let _ = recorder.tool_call_started(format!("call_{idx}"), turn.clone(), tool, op, ib);
     }
+    let workload = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency.clamp(1, 32)));
     let results = registry
-        .execute_batch(requests.clone(), max_concurrency)
+        .execute_batch(requests.clone(), max_concurrency, &workload)
         .await;
     for (idx, res) in results.iter().enumerate() {
         let (tool, args) = &requests[idx];
