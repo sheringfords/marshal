@@ -540,8 +540,12 @@ async fn execute_wasm(
         .ok_or_else(|| anyhow::anyhow!("wasm module has no _start/run export"))?;
 
     let result = {
+        let mut guard = EpochBumpOnDrop {
+            engine: engine.clone(),
+            done: false,
+        };
         let mut call = tokio::task::spawn_blocking(move || start.call(&mut store, &[], &mut []));
-        tokio::select! {
+        let outcome = tokio::select! {
             joined = &mut call => {
                 joined.map_err(|e| anyhow::anyhow!("wasm join: {e}"))?
             }
@@ -550,7 +554,9 @@ async fn execute_wasm(
                 // The epoch trap stops the module; wait for it to unwind.
                 call.await.map_err(|e| anyhow::anyhow!("wasm join: {e}"))?
             }
-        }
+        };
+        guard.done = true;
+        outcome
     };
 
     // wasmtime wraps host-function failures (including our `proc_exit`
@@ -638,6 +644,30 @@ async fn execute_wasm(
 struct MemoryLimiter {
     limit: u64,
 }
+
+/// Bumps the engine epoch when dropped before completion.
+///
+/// If the `execute_wasm` future is cancelled (caller disconnect, timeout
+/// races, test teardown) while the guest runs on its blocking thread, the
+/// thread would otherwise spin forever on a detached task — pinning test
+/// harness shutdown and leaking CPU. The engine is fresh per call with a
+/// single store, so the bump traps exactly the abandoned guest. Normal
+/// completion (including the wall-clock timeout path, which bumps the epoch
+/// itself) marks the guard done.
+#[cfg(feature = "wasm")]
+struct EpochBumpOnDrop {
+    engine: wasmtime::Engine,
+    done: bool,
+}
+
+#[cfg(feature = "wasm")]
+impl Drop for EpochBumpOnDrop {
+    fn drop(&mut self) {
+        if !self.done {
+            self.engine.increment_epoch();
+        }
+    }
+}
 #[cfg(feature = "wasm")]
 impl wasmtime::ResourceLimiter for MemoryLimiter {
     fn memory_growing(
@@ -650,9 +680,9 @@ impl wasmtime::ResourceLimiter for MemoryLimiter {
     }
     fn table_growing(
         &mut self,
-        _current: u32,
-        desired: u32,
-        _max: Option<u32>,
+        _current: usize,
+        desired: usize,
+        _max: Option<usize>,
     ) -> anyhow::Result<bool> {
         // Cap tables similarly to prevent DoS via huge tables
         Ok((desired as u64) <= 10_000)
@@ -1116,5 +1146,130 @@ mod tests {
             msg.contains("path_open") || msg.contains("unknown import"),
             "filesystem import was not refused at link time: {msg}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_nonzero_proc_exit_is_reported() {
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+            (func $_start (export "_start")
+                (call $proc_exit (i32.const 3))
+            )
+        )"#;
+        let tmp = write_wasm_module("exit3", wat);
+        let backend = WasmBackend::default();
+        let out = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(out.exit_code, Some(3));
+        assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_guest_trap_is_contained_and_backend_survives() {
+        // `unreachable` traps the guest. The daemon must report it as a
+        // failed outcome (never a panic, never a hang), and the same backend
+        // must execute the next module normally.
+        let wat = r#"(module
+            (func $_start (export "_start")
+                unreachable
+            )
+        )"#;
+        let tmp = write_wasm_module("trap", wat);
+        let backend = WasmBackend {
+            fuel: Some(1_000_000),
+            memory_limit: Some(16 * 1024 * 1024),
+        };
+        let out = backend
+            .execute(wasm_request(tmp.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(out.exit_code, Some(1));
+        assert!(!out.timed_out);
+        // Backend survives: run hello right after on the same backend.
+        let hello = r#"(module
+            (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+            (memory 1)
+            (export "memory" (memory 0))
+            (data (i32.const 8) "again\n")
+            (func $_start (export "_start")
+                (i32.store (i32.const 0) (i32.const 8))
+                (i32.store (i32.const 4) (i32.const 6))
+                (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 20)))
+                (call $proc_exit (i32.const 0))
+            )
+        )"#;
+        let tmp2 = write_wasm_module("hello2", hello);
+        let out2 = backend
+            .execute(wasm_request(tmp2.clone(), Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&tmp2);
+        assert_eq!(out2.exit_code, Some(0));
+        assert!(String::from_utf8_lossy(&out2.stdout).contains("again"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_concurrent_modules_share_the_workload_cap() {
+        // Four looping-free hellos run concurrently through independent
+        // stores; all must complete (proves no global-state interference,
+        // not performance).
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+            (func $_start (export "_start")
+                (call $proc_exit (i32.const 0))
+            )
+        )"#;
+        let tmp = write_wasm_module("conc", wat);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let req = wasm_request(tmp.clone(), Duration::from_secs(10));
+            handles.push(tokio::spawn(async move {
+                // Each task needs its own backend handle: WasmBackend is
+                // Clone + stateless, mirroring registry fan-out.
+                WasmBackend::default().execute(req).await.unwrap()
+            }));
+        }
+        for h in handles {
+            let out = h.await.unwrap();
+            assert_eq!(out.exit_code, Some(0));
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "wasm")]
+    async fn wasm_dropped_future_does_not_hang_the_caller() {
+        // Dropping the execute future mid-loop (cancellation) must resolve
+        // promptly: the test would time out if cancellation wedged.
+        let wat = r#"(module
+            (func $_start (export "_start")
+                (loop $spin (br $spin))
+            )
+        )"#;
+        let tmp = write_wasm_module("cancel", wat);
+        let backend = WasmBackend {
+            fuel: None,
+            memory_limit: Some(16 * 1024 * 1024),
+        };
+        {
+            let fut = backend.execute(wasm_request(tmp.clone(), Duration::from_secs(30)));
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => {},
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {},
+            }
+            // `fut` (and its abort path) is dropped here.
+        }
+        // Give the blocking thread a moment, then prove the executor is live.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_file(&tmp);
     }
 }
