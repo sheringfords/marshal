@@ -1046,11 +1046,8 @@ async fn execute_batch(
     purge_expired_sessions(&state).await;
     // Auto-scope agentic state to top-level session
     inject_session_id(&mut req.requests, &req.session_id);
-    // A caller-supplied scope root is untrusted: drop it before admission.
-    // The trusted root is bound per item after admission instead.
-    for r in &mut req.requests {
-        strip_scope_key(&mut r.args);
-    }
+    // A caller-supplied scope root is untrusted: the coordinator drops it
+    // inside preflight before admission.
     // Admission control: limit batch size and concurrency to avoid OOM / fan-out.
     const MAX_BATCH: usize = 64;
     if req.requests.len() > MAX_BATCH {
@@ -1086,36 +1083,19 @@ async fn execute_batch(
             .into_response();
     }
     // Session validation per item against its effective session (per-item
-    // override wins, else the top-level session), then per-item egress. A
-    // top-level session must still exist even for an empty batch: an unknown
-    // session is a 404 before any item runs. The helpers hold the sessions
-    // lock only for one lookup each, so admission here cannot deadlock
-    // against itself.
+    // override wins, else the top-level session), then per-item egress and
+    // scope binding — all inside the coordinator's all-items-first preflight.
+    // A top-level session must still exist even for an empty batch: an
+    // unknown session is a 404 before any item runs.
     let top_sid = req.session_id.clone();
-    if let Some(sid) = &top_sid {
-        if let Some(resp) = require_session(&state, sid).await {
-            return resp;
-        }
-    }
-    for r in &req.requests {
-        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
-        if let Some(resp) = admit_session(&state, effective, &r.tool, &r.args).await {
-            return resp;
-        }
-        if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
-            return resp;
-        }
-    }
-    // Bind every filesystem item to its effective session root. A session
-    // that lapsed between admission and binding fails closed here.
-    for r in &mut req.requests {
-        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
-        if let Some(resp) = bind_session_scope(&state, effective, &r.tool, &mut r.args).await {
-            return resp;
-        }
-    }
-    let inner: Vec<(String, serde_json::Value)> =
-        req.requests.into_iter().map(|r| (r.tool, r.args)).collect();
+    let admitted = match preflight_all(&state, top_sid.as_ref(), &mut req.requests).await {
+        Ok(items) => items,
+        Err(resp) => return resp,
+    };
+    let inner: Vec<(String, serde_json::Value)> = admitted
+        .into_iter()
+        .map(|item| (item.tool, item.args))
+        .collect();
     state.metrics.inc_request();
     let registry = state.registry.read().await.clone();
     // Workload permits come from the shared global semaphore: at most
@@ -1128,14 +1108,7 @@ async fn execute_batch(
         match r {
             Ok(o) => {
                 // One audit record per executed item, as in `execute`.
-                audit_log(&state, &o, o.duration_ms).await;
-                let tool = o.tool.clone();
-                state
-                    .metrics
-                    .observe_with_tool(&tool, o.success, o.duration_ms);
-                outcomes.push(
-                    serde_json::to_value(o).unwrap_or(serde_json::json!({"error":"serialize"})),
-                );
+                outcomes.push(record_outcome(&state, &o, o.duration_ms).await);
             }
             Err(e) => {
                 state.metrics.observe_with_tool("", false, 0);
@@ -1158,10 +1131,8 @@ async fn execute_sequence(
     purge_expired_sessions(&state).await;
     // Auto-scope agentic state to top-level session
     inject_session_id(&mut req.steps, &req.session_id);
-    // A caller-supplied scope root is untrusted: drop it before admission.
-    for r in &mut req.steps {
-        strip_scope_key(&mut r.args);
-    }
+    // A caller-supplied scope root is untrusted: the coordinator drops it
+    // inside preflight before admission.
     const MAX_STEPS: usize = 32;
     if req.steps.len() > MAX_STEPS {
         return (
@@ -1177,40 +1148,22 @@ async fn execute_sequence(
         Ok(permit) => permit,
         Err(resp) => return resp,
     };
-    // Session validation mirrors the batch contract: every step is admitted
-    // against its effective session (per-step override wins, else the
-    // top-level session), and a top-level session must exist even for an
-    // empty sequence. Egress is admitted per step afterwards, before anything
-    // runs.
-    if let Some(sid) = &req.session_id {
-        if let Some(resp) = require_session(&state, sid).await {
-            return resp;
-        }
-    }
+    // Session validation mirrors the batch contract: every step goes through
+    // the coordinator's all-items-first preflight against its effective
+    // session (per-step override wins, else top-level), with the top-level
+    // session required even for an empty sequence. Egress is admitted per
+    // step inside the same preflight, before anything runs.
     let top_sid = req.session_id.clone();
-    for r in &req.steps {
-        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
-        if let Some(resp) = admit_session(&state, effective, &r.tool, &r.args).await {
-            return resp;
-        }
-    }
-    // Egress check for each step if http
-    for r in &req.steps {
-        if let Some(resp) = admit_egress(&state, &r.tool, &r.args).await {
-            return resp;
-        }
-    }
-    // Bind every filesystem step to its effective session root, as in batch.
-    for r in &mut req.steps {
-        let effective = effective_session(top_sid.as_ref(), r.session_id.as_ref());
-        if let Some(resp) = bind_session_scope(&state, effective, &r.tool, &mut r.args).await {
-            return resp;
-        }
-    }
+    let admitted = match preflight_all(&state, top_sid.as_ref(), &mut req.steps).await {
+        Ok(items) => items,
+        Err(resp) => return resp,
+    };
     let continue_on_error = req.continue_on_error.unwrap_or(false);
-    let total = req.steps.len();
-    let inner: Vec<(String, serde_json::Value)> =
-        req.steps.into_iter().map(|r| (r.tool, r.args)).collect();
+    let total = admitted.len();
+    let inner: Vec<(String, serde_json::Value)> = admitted
+        .into_iter()
+        .map(|item| (item.tool, item.args))
+        .collect();
     state.metrics.inc_request();
     let registry = state.registry.read().await.clone();
     let results = registry.execute_sequence(inner, continue_on_error).await;
@@ -1220,14 +1173,7 @@ async fn execute_sequence(
         match r {
             Ok(o) => {
                 // One audit record per executed step, as in `execute`.
-                audit_log(&state, &o, o.duration_ms).await;
-                let tool = o.tool.clone();
-                state
-                    .metrics
-                    .observe_with_tool(&tool, o.success, o.duration_ms);
-                outcomes.push(
-                    serde_json::to_value(o).unwrap_or(serde_json::json!({"error":"serialize"})),
-                );
+                outcomes.push(record_outcome(&state, &o, o.duration_ms).await);
             }
             Err(e) => {
                 state.metrics.observe_with_tool("", false, 0);
@@ -1269,51 +1215,31 @@ async fn execute_stream(
         Ok(permit) => permit,
         Err(resp) => return resp,
     };
-    // A caller-supplied scope root is untrusted: drop it before admission.
-    strip_scope_key(&mut req.args);
-    // Same session + egress admission as `execute`: a streamed call can never
-    // skip what a single call checks.
-    if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
-        return resp;
-    }
-    // Bind filesystem execution to the trusted session root, as in `execute`.
-    if let Some(resp) =
-        bind_session_scope(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
+    // A caller-supplied scope root is untrusted: the coordinator drops it
+    // before admission, admits session + egress, and binds the trusted root —
+    // identical to `execute`, so a streamed call can never skip what a
+    // single call checks.
+    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
     {
-        return resp;
-    }
+        Ok(item) => item,
+        Err(resp) => return resp,
+    };
 
     let started = Instant::now();
     let registry = state.registry.read().await.clone();
-    let outcome = if let Some(key) = req.idempotency_key {
-        match registry.execute_once(&key, &req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                let err_event = Event::default()
-                    .event("error")
-                    .data(serde_json::json!({"error": e.to_string()}).to_string());
-                let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
-                return Sse::new(stream).into_response();
-            }
-        }
-    } else {
-        match registry.execute(&req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                let err_event = Event::default()
-                    .event("error")
-                    .data(serde_json::json!({"error": e.to_string()}).to_string());
-                let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
-                return Sse::new(stream).into_response();
-            }
+    let outcome = match run_one(&registry, item, req.idempotency_key).await {
+        Ok(o) => o,
+        Err(e) => {
+            let err_event = Event::default()
+                .event("error")
+                .data(serde_json::json!({"error": e.to_string()}).to_string());
+            let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(err_event));
+            return Sse::new(stream).into_response();
         }
     };
 
     // Audit + metrics exactly as `execute`: one record per executed tool.
-    audit_log(&state, &outcome, started.elapsed().as_millis() as u64).await;
-    state
-        .metrics
-        .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
+    let _ = record_outcome(&state, &outcome, started.elapsed().as_millis() as u64).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
 
