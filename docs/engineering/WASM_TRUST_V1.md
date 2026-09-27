@@ -49,3 +49,16 @@ bump on that path) — 30 CPU-minutes burned before it was killed. Fix:
 completed, so an abandoned guest traps instead of spinning. The engine is
 fresh per call with a single store, so nothing else observes the bump. This
 was a pre-existing leak (old MAR-REV-008 class), not a 36 regression.
+
+## Performance (release, fixed hello module, 30 reps, shared desktop)
+
+| backend | p50 | p95 | mean | binary | max RSS |
+|---------|-----|-----|------|--------|---------|
+| wasmtime 22.0.1 | 9–20 ms | 31–40 ms | 12–20 ms | 10.8 MB | 6.8 MB |
+| wasmtime 36.0.16 | 1.0–3.5 ms | 2–20 ms | 1.1–6.3 ms | 16.9 MB | 7.5 MB |
+
+Each iteration builds a fresh `Engine` + compiles the module, so these are
+end-to-end numbers dominated by Cranelift compile time. Ranges across runs
+(machine load); no steady-state caching configured. Deps: 320 → 317 unique
+crates with `wasm`. No performance claim beyond: the migration does not
+regress execution, at the cost of +6 MB binary.

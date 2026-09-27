@@ -87,12 +87,13 @@ authoritative for vulnerabilities, deny for bans/licenses/sources.
 ## 4. Decisions
 
 - Applied: rustls `0.23.43 → 0.23.45` (compatible; full matrix green).
-- Not applied: Wasmtime 22 → 24+ major upgrade — separate, explicitly scoped
-  follow-up (API migration + WASI re-verification + adversarial re-testing).
-  Until then the `wasm` feature carries 2 critical + 1 high advisories, two
-  of which are in reachable guest-compiler paths.
+- Applied (WASM_TRUST_V1): wasmtime `22.0.1 → 36.0.16` — clears all 18
+  committed advisories (`cargo audit` exit 0; only 2 allowed warnings
+  remain: unmaintained fxhash, yanked chacha20, both transitive). MSRV 1.88
+  preserved (wasmtime 36 rust-version 1.86). Migration diff: one trait
+  signature + one cancellation guard; adversarial suite extended and green
+  on both platforms.
 - Not suppressed: no `ignore` entries added to `deny.toml`, no audit
-  exclusions; the supply-chain gate stays red and is reported as such.
-- Restriction in force: do not present the WASM backend as a hardened
-  isolation boundary until the upgrade lands; local-only deployments are
-  unaffected (no wasmtime in the default graph).
+  exclusions.
+- Restriction lifted for `wasm` subject to the remaining notes below; the
+  `ContainerBackend` fail-closed posture is unchanged.
