@@ -365,11 +365,6 @@ struct ExecuteRequest {
     idempotency_key: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ExecuteResponse {
-    outcome: ToolOutcome,
-}
-
 #[derive(Deserialize)]
 struct BatchRequest {
     requests: Vec<ExecuteRequest>,
@@ -848,8 +843,7 @@ fn effective_session<'a>(
 /// lapsed) and writes the canonical root under [`SESSION_SCOPE_KEY`], which
 /// the tool enforces at execution time. Non-filesystem tools and
 /// session-less items are left untouched.
-async fn bind_session_scope(
-    state: &AppState,
+async fn bind_session_scope(    state: &AppState,
     session_id: Option<&String>,
     tool: &str,
     args: &mut serde_json::Value,
@@ -872,6 +866,118 @@ async fn bind_session_scope(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Execution coordinator (V2-S1)
+//
+// One authoritative path for per-item preparation and outcome recording.
+// Endpoint adapters keep transport shaping, size caps, workload modes and
+// response construction; every shared security decision and every audit /
+// metrics write funnels through here. See
+// docs/engineering/ENDPOINT_BEHAVIOR_MATRIX_V2_S1.md for the contract each
+// adapter preserves.
+// ---------------------------------------------------------------------------
+
+/// A single admitted unit of work: the tool, its args (with the trusted
+/// session scope already bound for filesystem items), and the session it was
+/// admitted under (`None` = workspace-scoped). Constructed only by
+/// `prepare_one` / `preflight_all`, never directly by handlers.
+struct AdmittedItem {
+    tool: String,
+    args: serde_json::Value,
+}
+
+/// Strip caller scope forgery, admit session + egress, then bind the trusted
+/// scope root. Single execution and buffered streaming share this path, so a
+/// streamed call can never skip what a single call checks.
+async fn prepare_one(
+    state: &AppState,
+    session_id: Option<&String>,
+    tool: &str,
+    args: &mut serde_json::Value,
+) -> Result<AdmittedItem, Response> {
+    strip_scope_key(args);
+    if let Some(resp) = admit_item(state, session_id, tool, args).await {
+        return Err(resp);
+    }
+    if let Some(resp) = bind_session_scope(state, session_id, tool, args).await {
+        return Err(resp);
+    }
+    Ok(AdmittedItem {
+        tool: tool.to_string(),
+        args: args.clone(),
+    })
+}
+
+/// Admit every item of a batch/sequence before anything runs: the top-level
+/// session must exist (even for an empty request), then each item is admitted
+/// against its effective session (per-item override wins) plus egress, then
+/// each filesystem item is bound to its effective session root. The first
+/// failure denies the whole request; no item executes unless all pass.
+async fn preflight_all(
+    state: &AppState,
+    top_sid: Option<&String>,
+    items: &mut [ExecuteRequest],
+) -> Result<Vec<AdmittedItem>, Response> {
+    for r in items.iter_mut() {
+        strip_scope_key(&mut r.args);
+    }
+    if let Some(sid) = top_sid {
+        if let Some(resp) = require_session(state, sid).await {
+            return Err(resp);
+        }
+    }
+    for r in items.iter() {
+        let effective = effective_session(top_sid, r.session_id.as_ref());
+        if let Some(resp) = admit_session(state, effective, &r.tool, &r.args).await {
+            return Err(resp);
+        }
+        if let Some(resp) = admit_egress(state, &r.tool, &r.args).await {
+            return Err(resp);
+        }
+    }
+    let mut admitted = Vec::with_capacity(items.len());
+    for r in items.iter_mut() {
+        let effective = effective_session(top_sid, r.session_id.as_ref());
+        if let Some(resp) = bind_session_scope(state, effective, &r.tool, &mut r.args).await {
+            return Err(resp);
+        }
+        admitted.push(AdmittedItem {
+            tool: r.tool.clone(),
+            args: r.args.clone(),
+        });
+    }
+    Ok(admitted)
+}
+
+/// Run one admitted item through a registry snapshot, honoring idempotency
+/// keys exactly as single execution always has.
+async fn run_one(
+    registry: &ToolRegistry,
+    item: AdmittedItem,
+    idempotency_key: Option<String>,
+) -> Result<ToolOutcome, anyhow::Error> {
+    if let Some(key) = idempotency_key {
+        registry.execute_once(&key, &item.tool, item.args).await
+    } else {
+        registry.execute(&item.tool, item.args).await
+    }
+}
+
+/// Record one executed outcome: audit + metrics + response value. The single
+/// choke point for successful-outcome recording on every endpoint; `elapsed`
+/// is the handler-measured wall time, matching previous per-endpoint values.
+async fn record_outcome(
+    state: &AppState,
+    outcome: &ToolOutcome,
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    audit_log(state, outcome, elapsed_ms).await;
+    state
+        .metrics
+        .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
+    serde_json::to_value(outcome).unwrap_or(serde_json::json!({"error":"serialize"}))
+}
+
 // `headers` skipped: see `list_tools`. It carries the bearer token.
 #[tracing::instrument(skip(state, req, headers), fields(tool = %req.tool))]
 async fn execute(
@@ -890,63 +996,33 @@ async fn execute(
         Err(resp) => return resp,
     };
 
-    // A caller-supplied scope root is untrusted: drop it before admission.
-    strip_scope_key(&mut req.args);
-    // Session validation: if session_id given, ensure it exists and paths are inside it.
-    // Egress proxy — server-side SSRF enforcement (defense-in-depth).
-    if let Some(resp) = admit_item(&state, req.session_id.as_ref(), &req.tool, &req.args).await {
-        return resp;
-    }
-    // Bind filesystem execution to the trusted session root (no-op without
-    // a session). The tool enforces this at execution time, after any
-    // template resolution admission cannot see.
-    if let Some(resp) =
-        bind_session_scope(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
+    // A caller-supplied scope root is untrusted: the coordinator drops it
+    // before admission, admits session + egress, and binds the trusted root.
+    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
     {
-        return resp;
-    }
+        Ok(item) => item,
+        Err(resp) => return resp,
+    };
 
     let started = Instant::now();
     let registry = state.registry.read().await.clone();
-    let outcome = if let Some(key) = req.idempotency_key {
-        match registry.execute_once(&key, &req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, tool = %req.tool, "execute_once rejected");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: extract_code(&e.to_string()),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        match registry.execute(&req.tool, req.args).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, tool = %req.tool, "execute rejected");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                        code: extract_code(&e.to_string()),
-                    }),
-                )
-                    .into_response();
-            }
+    let outcome = match run_one(&registry, item, req.idempotency_key).await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, tool = %req.tool, "execute rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                    code: extract_code(&e.to_string()),
+                }),
+            )
+                .into_response();
         }
     };
 
-    // Audit: JSONL with sha256 (P0 redaction intact).
-    audit_log(&state, &outcome, started.elapsed().as_millis() as u64).await;
-
-    // Metrics + OTel
-    state
-        .metrics
-        .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
+    // Audit: JSONL with sha256 (P0 redaction intact), metrics + OTel.
+    let body = record_outcome(&state, &outcome, started.elapsed().as_millis() as u64).await;
     info!(
         tool = %outcome.tool,
         success = outcome.success,
@@ -955,7 +1031,7 @@ async fn execute(
         "tool executed via http"
     );
 
-    (StatusCode::OK, Json(ExecuteResponse { outcome })).into_response()
+    (StatusCode::OK, Json(serde_json::json!({"outcome": body}))).into_response()
 }
 
 async fn execute_batch(
