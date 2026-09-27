@@ -2117,14 +2117,20 @@ async fn blocked_http_destination_is_refused_on_batch_and_sequence() {
     let ws = Workspace::new("char-egress-multi");
     let app = ws.app();
     let args = json!({"url": "https://169.254.169.254/latest/meta-data/"});
-    for (uri, key) in [("/v1/execute/batch", "requests"), ("/v1/execute/sequence", "steps")] {
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
         let (status, body) = send(
             &app,
             post(uri, json!({key: [execute("http", args.clone())]})),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
-        assert_eq!(body["code"], "host resolves to a blocked address", "{uri}: {body}");
+        assert_eq!(
+            body["code"], "host resolves to a blocked address",
+            "{uri}: {body}"
+        );
     }
 }
 
@@ -2134,10 +2140,7 @@ async fn stream_error_event_on_registry_rejection() {
     let app = ws.app();
     let (status, text) = send_text(
         &app,
-        post(
-            "/v1/execute/stream",
-            execute("no-such-tool", json!({})),
-        ),
+        post("/v1/execute/stream", execute("no-such-tool", json!({}))),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2152,7 +2155,10 @@ async fn sse_events_arrive_in_summary_chunk_done_order() {
         &app,
         post(
             "/v1/execute/stream",
-            execute("shell", json!({"program": echo_path(), "args": ["hello-sse"]})),
+            execute(
+                "shell",
+                json!({"program": echo_path(), "args": ["hello-sse"]}),
+            ),
         ),
     )
     .await;
@@ -2174,7 +2180,10 @@ async fn denied_batch_and_sequence_preflight_writes_no_audit() {
     let ws = Workspace::new("char-preflight-purity");
     let (app, audit_path) = app_with_audit(&ws);
     let bad_sid = "00000000-0000-0000-0000-000000000000";
-    for (uri, key) in [("/v1/execute/batch", "requests"), ("/v1/execute/sequence", "steps")] {
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
         let (status, _) = send(
             &app,
             post(
@@ -2224,7 +2233,10 @@ async fn forged_scope_key_is_ignored_on_all_endpoints() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "path_not_allowed");
-    for (uri, key) in [("/v1/execute/batch", "requests"), ("/v1/execute/sequence", "steps")] {
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
         let (status, _) = send(
             &app,
             post(
@@ -2253,7 +2265,10 @@ async fn per_item_session_denials_without_top_level() {
     let ws = Workspace::new("char-per-item-sid");
     let app = ws.app();
     // Unknown per-item session, no top-level: whole-request 404 on both.
-    for (uri, key) in [("/v1/execute/batch", "requests"), ("/v1/execute/sequence", "steps")] {
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
         let (status, body) = send(
             &app,
             post(
@@ -2276,12 +2291,11 @@ async fn empty_batch_and_sequence_reject_bad_top_level_session() {
     let ws = Workspace::new("char-empty-top");
     let app = ws.app();
     let bad_sid = "00000000-0000-0000-0000-000000000000";
-    for (uri, key) in [("/v1/execute/batch", "requests"), ("/v1/execute/sequence", "steps")] {
-        let (status, body) = send(
-            &app,
-            post(uri, json!({"session_id": bad_sid, key: []})),
-        )
-        .await;
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, body) = send(&app, post(uri, json!({"session_id": bad_sid, key: []}))).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(body["code"], "session_not_found", "{uri}: {body}");
     }
@@ -2336,7 +2350,14 @@ async fn batch_item_error_releases_permits() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send(&app, post("/v1/execute", execute("system", json!({"operation": "now"})))).await;
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -2362,7 +2383,14 @@ async fn aborted_sequence_releases_its_permit() {
         }
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let (status, _) = send(&app, post("/v1/execute", execute("system", json!({"operation": "now"})))).await;
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -2375,7 +2403,14 @@ async fn edge_rejections_skip_request_count_but_shed_counts() {
     });
     // Edge rejections (401/429) happen before inc_request; admission
     // rejections (404/403/503) happen after it. Pin the current placement.
-    let (status, _) = send(&app, post("/v1/execute", execute("system", json!({"operation": "now"})))).await;
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = send(
         &app,
@@ -2399,7 +2434,14 @@ async fn edge_rejections_skip_request_count_but_shed_counts() {
     ));
     let contender = async {
         tokio::time::sleep(Duration::from_millis(80)).await;
-        send(&app, post("/v1/execute", execute("system", json!({"operation": "now"})))).await
+        send(
+            &app,
+            post(
+                "/v1/execute",
+                execute("system", json!({"operation": "now"})),
+            ),
+        )
+        .await
     };
     let (_slow, (status, _)) = tokio::join!(slow, contender);
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

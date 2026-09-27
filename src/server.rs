@@ -844,7 +844,8 @@ fn effective_session<'a>(
 /// lapsed) and writes the canonical root under [`SESSION_SCOPE_KEY`], which
 /// the tool enforces at execution time. Non-filesystem tools and
 /// session-less items are left untouched.
-async fn bind_session_scope(    state: &AppState,
+async fn bind_session_scope(
+    state: &AppState,
     session_id: Option<&String>,
     tool: &str,
     args: &mut serde_json::Value,
@@ -890,6 +891,7 @@ struct AdmittedItem {
 /// Strip caller scope forgery, admit session + egress, then bind the trusted
 /// scope root. Single execution and buffered streaming share this path, so a
 /// streamed call can never skip what a single call checks.
+#[allow(clippy::result_large_err)]
 async fn prepare_one(
     state: &AppState,
     session_id: Option<&String>,
@@ -914,6 +916,7 @@ async fn prepare_one(
 /// against its effective session (per-item override wins) plus egress, then
 /// each filesystem item is bound to its effective session root. The first
 /// failure denies the whole request; no item executes unless all pass.
+#[allow(clippy::result_large_err)]
 async fn preflight_all(
     state: &AppState,
     top_sid: Option<&String>,
@@ -996,8 +999,7 @@ async fn execute(
 
     // A caller-supplied scope root is untrusted: the coordinator drops it
     // before admission, admits session + egress, and binds the trusted root.
-    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
-    {
+    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await {
         Ok(item) => item,
         Err(resp) => return resp,
     };
@@ -1217,8 +1219,7 @@ async fn execute_stream(
     // before admission, admits session + egress, and binds the trusted root —
     // identical to `execute`, so a streamed call can never skip what a
     // single call checks.
-    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await
-    {
+    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await {
         Ok(item) => item,
         Err(resp) => return resp,
     };
