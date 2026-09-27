@@ -48,20 +48,15 @@ impl EventType {
 }
 
 /// Task outcome — explicit, never inferred from tool success alone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOutcome {
     Success,
     Failure,
     Partial,
     InvalidRun,
+    #[default]
     Unknown,
-}
-
-impl Default for TaskOutcome {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Optional per-turn token usage. Every field is optional; unknown stays `null`, never zero.

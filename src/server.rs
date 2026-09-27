@@ -122,10 +122,7 @@ fn check_bind_safety(addr: &SocketAddr, auth_token: &Option<String>) -> anyhow::
 
 /// 401 response when the bearer token is missing/wrong. `None` = authorized.
 fn check_auth(headers: &axum::http::HeaderMap, state: &AppState) -> Option<Response> {
-    let expected = match &state.auth_token {
-        Some(t) => t,
-        None => return None,
-    };
+    let expected = state.auth_token.as_ref()?;
     let got = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
