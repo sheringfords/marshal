@@ -57,7 +57,7 @@ fn steps_for_task(
     let mut steps: Vec<(String, Value, String)> = Vec::new();
     let mut turn = 1;
     let mut next_turn = || {
-        let t = format!("turn_{}", turn);
+        let t = format!("turn_{turn}");
         turn += 1;
         t
     };
@@ -447,7 +447,7 @@ async fn main() -> anyhow::Result<()> {
                 current_turn = Some(turn_id.clone());
             }
             call_idx += 1;
-            let call_id = format!("call_{:03}", call_idx);
+            let call_id = format!("call_{call_idx:03}");
             // instrument via registry
             let res = instrument_execute(
                 &registry,
@@ -459,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
             if let Err(e) = res {
-                eprintln!("tool {} failed: {}", tool, e);
+                eprintln!("tool {tool} failed: {e}");
             }
         }
         if let Some(prev) = current_turn.take() {

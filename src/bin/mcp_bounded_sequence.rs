@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("mcp parse error: {}", e);
+                eprintln!("mcp parse error: {e}");
                 line.clear();
                 continue;
             }

@@ -300,7 +300,7 @@ impl crate::Tool for BoundedSequenceTool {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing tool in step"))?;
             if !self.registry.has_tool(tool) {
-                anyhow::bail!("tool_not_found: {}", tool);
+                anyhow::bail!("tool_not_found: {tool}");
             }
             if tool == "bounded_sequence" {
                 anyhow::bail!("nested bounded_sequence not allowed");

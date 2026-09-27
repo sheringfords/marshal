@@ -209,8 +209,7 @@ fn main() -> anyhow::Result<()> {
     let mut md = String::new();
     md.push_str("# Phase 2 Comparison\n\n");
     md.push_str(&format!(
-        "Baseline: {}, Treatment: {}\n\n",
-        baseline_dir, treatment_dir
+        "Baseline: {baseline_dir}, Treatment: {treatment_dir}\n\n",
     ));
     md.push_str(&format!(
         "Paired tasks: {}, adoption: {}/{} ({:.0}%)\n\n",
@@ -220,16 +219,12 @@ fn main() -> anyhow::Result<()> {
         adoption as f64 / total as f64 * 100.0
     ));
     md.push_str("## Simulated (20 tasks)\n");
+    md.push_str(&format!("- Median round-trip reduction: {median_rt:.1}%\n",));
+    md.push_str(&format!("- Median handoff reduction: {median_h:.1}%\n"));
     md.push_str(&format!(
-        "- Median round-trip reduction: {:.1}%\n",
-        median_rt
+        "- Median wall change: {median_wall:.1}% (negative = slower)\n",
     ));
-    md.push_str(&format!("- Median handoff reduction: {:.1}%\n", median_h));
-    md.push_str(&format!(
-        "- Median wall change: {:.1}% (negative = slower)\n",
-        median_wall
-    ));
-    md.push_str(&format!("- Mean handoff reduction: {:.1}%\n\n", mean_h));
+    md.push_str(&format!("- Mean handoff reduction: {mean_h:.1}%\n\n"));
     md.push_str("## Per-task (simulated)\n");
     for p in output["simulated"]["paired"].as_array().unwrap() {
         md.push_str(&format!("- {} ({} {}): base rt {}/h {} -> treat rt {}/h {} (handoff -{:.0}%, rt -{:.0}%) success {} vs {} {}\n",
@@ -251,10 +246,10 @@ fn main() -> anyhow::Result<()> {
         "- Median handoff reduction: {:.1}%\n",
         median(real_h.clone())
     ));
-    md.push_str(&format!("- Success match: {}/8\n", real_success_match));
+    md.push_str(&format!("- Success match: {real_success_match}/8\n"));
     md.push_str("- Note: token comparison omitted (mock data, per hard constraint)\n");
     std::fs::write(&md_path, md)?;
-    println!("wrote {} and {}", out_path, md_path);
+    println!("wrote {out_path} and {md_path}");
     println!(
         "median handoff reduction simulated {:.1}% real {:.1}%",
         median_h,
