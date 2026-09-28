@@ -950,7 +950,7 @@ async fn health_and_metrics_are_not_throttled() {
 // ── idempotency ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn the_same_idempotency_key_does_not_run_the_tool_twice() {
+async fn the_same_idempotency_key_with_identical_work_replays_without_rerunning() {
     let ws = Workspace::new("idempotency");
     let app = ws.app();
     let target = ws.path("counter.txt");
@@ -966,11 +966,34 @@ async fn the_same_idempotency_key_does_not_run_the_tool_twice() {
     let (status, first) = send(&app, post("/v1/execute", write("first"))).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Same key, different content: the cached outcome comes back and the file
-    // is untouched.
-    let (status, second) = send(&app, post("/v1/execute", write("second"))).await;
+    // Same key, identical work: the prior outcome replays; the tool runs once.
+    let (status, second) = send(&app, post("/v1/execute", write("first"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first["outcome"]["summary"], second["outcome"]["summary"]);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+}
+
+#[tokio::test]
+async fn the_same_idempotency_key_with_different_work_conflicts() {
+    let ws = Workspace::new("idempotency_conflict");
+    let app = ws.app();
+    let target = ws.path("counter.txt");
+
+    let write = |content: &str| {
+        json!({
+            "tool": "filesystem",
+            "idempotency_key": "fixed-key",
+            "args": {"operation": "write", "path": target, "content": content},
+        })
+    };
+
+    let (status, _) = send(&app, post("/v1/execute", write("first"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Same key, different content: a 409 conflict, and the file is untouched.
+    let (status, body) = send(&app, post("/v1/execute", write("second"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "idempotency_conflict", "{body}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
 }
 
@@ -1429,8 +1452,27 @@ async fn stream_honors_idempotency_like_execute() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Same key over SSE with different content: the cached outcome replays
-    // and the file is untouched.
+    // Same key and identical work over SSE: the outcome replays with a done
+    // event and the file is untouched.
+    let (status, text) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            json!({
+                "tool": "filesystem",
+                "idempotency_key": "stream-key",
+                "args": {"operation": "write", "path": target, "content": "first"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.contains("event: done"), "{text}");
+    assert!(!text.contains("event: error"), "{text}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+
+    // Same key with different work over SSE: a conflict error event, never
+    // a replay — identical identity semantics to `execute`.
     let (status, text) = send_text(
         &app,
         post(
@@ -1444,7 +1486,8 @@ async fn stream_honors_idempotency_like_execute() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(text.contains("event: done"), "{text}");
+    assert!(text.contains("event: error"), "{text}");
+    assert!(text.contains("idempotency_conflict"), "{text}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
 }
 

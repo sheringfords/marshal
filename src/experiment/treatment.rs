@@ -2,7 +2,7 @@
 use serde_json::{json, Value};
 use std::time::Instant;
 
-use crate::{ToolOutcome, ToolRegistry};
+use crate::{ContractedCall, ToolOutcome, ToolRegistry};
 
 use super::recorder::TaskRecorder;
 
@@ -330,8 +330,12 @@ impl crate::Tool for BoundedSequenceTool {
             let seq_id = format!("seq_{}", uuid::Uuid::new_v4());
             execute_bounded_sequence(&self.registry, rec, None, &seq_id, steps).await
         } else {
-            // No recorder: just run via execute_sequence
-            let res = self.registry.execute_sequence(steps, false).await;
+            // No recorder: explicit trusted-local calls, no HTTP admission.
+            let contracted: Vec<ContractedCall> = steps
+                .iter()
+                .map(|(tool, a)| ContractedCall::local(&self.registry, tool, a.clone()))
+                .collect();
+            let res = self.registry.execute_sequence(contracted, false).await;
             // Build summary similar
             let mut per_step = Vec::new();
             let mut success = true;

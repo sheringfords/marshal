@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use marshall::{FileSystemTool, Sandbox, Tool};
+use marshall::{ExecutionContract, ExecutionScope, FileSystemTool, Sandbox, Tool};
 use serde_json::json;
 
 struct Fixture {
@@ -140,12 +140,6 @@ async fn swap_race_write_never_escapes_session() {
     let f = Fixture::new("write-session");
     std::fs::create_dir_all(f.at("root/session")).unwrap();
     std::fs::create_dir_all(f.at("root/shared")).unwrap();
-    let scope = f
-        .at("root/session")
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
 
     std::fs::create_dir_all(f.at("root/session/sub-real")).unwrap();
     std::fs::write(f.at("root/session/sub-real/file.txt"), "real").unwrap();
@@ -157,15 +151,20 @@ async fn swap_race_write_never_escapes_session() {
     );
 
     let tool = f.tool();
+    let scope = f.at("root/session").canonicalize().unwrap();
     for i in 0..ITERATIONS {
-        let _ = tool
-            .execute(json!({
-                "operation": "write",
-                "path": f.at("root/session/sub-real/file.txt").to_string_lossy(),
-                "content": format!("PAYLOAD-{i}"),
-                marshall::server::SESSION_SCOPE_KEY: scope,
-            }))
-            .await;
+        let args = json!({
+            "operation": "write",
+            "path": f.at("root/session/sub-real/file.txt").to_string_lossy(),
+            "content": format!("PAYLOAD-{i}"),
+        });
+        let ctx = ExecutionContract::admit(
+            ExecutionScope::Session(scope.clone()),
+            "filesystem",
+            &args,
+            marshall::ADHOC_POLICY_IDENTITY.to_string(),
+        );
+        let _ = tool.execute_with(&ctx, args).await;
     }
     done.store(true, Ordering::Relaxed);
     racer.join().unwrap();
@@ -221,34 +220,48 @@ async fn concurrent_scoped_writes_stay_inside() {
     let f = Fixture::new("concurrent");
     std::fs::create_dir_all(f.at("root/a")).unwrap();
     std::fs::create_dir_all(f.at("root/b")).unwrap();
-    let scope_a = f
-        .at("root/a")
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
     let tool = Arc::new(f.tool());
 
     let mut handles = Vec::new();
     for i in 0..16usize {
         let tool = tool.clone();
-        let (scope, rel) = if i % 2 == 0 {
-            (scope_a.clone(), format!("root/a/f{i}.txt"))
+        let scoped = i % 2 == 0;
+        let scope_root = scoped.then(|| {
+            f.at("root/a")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let rel = if scoped {
+            format!("root/a/f{i}.txt")
         } else {
             // No scope: workspace behavior confines to the sandbox root.
-            (String::new(), format!("root/b/f{i}.txt"))
+            format!("root/b/f{i}.txt")
         };
         let path = f.at(&rel).to_string_lossy().into_owned();
         handles.push(tokio::spawn(async move {
-            let mut args = serde_json::json!({
+            let args = serde_json::json!({
                 "operation": "write",
                 "path": path,
                 "content": "x",
             });
-            if !scope.is_empty() {
-                args[marshall::server::SESSION_SCOPE_KEY] = json!(scope);
+            match scope_root {
+                // Typed contract scope, never caller JSON.
+                Some(root) => {
+                    let ctx = ExecutionContract::admit(
+                        ExecutionScope::Session(std::path::PathBuf::from(root)),
+                        "filesystem",
+                        &args,
+                        marshall::ADHOC_POLICY_IDENTITY.to_string(),
+                    );
+                    tool.execute_with(&ctx, args)
+                        .await
+                        .map(|o| o.success)
+                        .unwrap_or(false)
+                }
+                None => tool.execute(args).await.map(|o| o.success).unwrap_or(false),
             }
-            tool.execute(args).await.map(|o| o.success).unwrap_or(false)
         }));
     }
     for h in handles {

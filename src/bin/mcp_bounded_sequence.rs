@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use marshall::{
-    shell::AllowedCommand, ArgumentPolicy, FileSystemTool, Sandbox, ShellTool, ToolRegistry,
+    shell::AllowedCommand, ArgumentPolicy, ContractedCall, FileSystemTool, Sandbox, ShellTool,
+    ToolRegistry,
 };
 
 fn create_registry() -> anyhow::Result<ToolRegistry> {
@@ -180,9 +181,13 @@ async fn main() -> anyhow::Result<()> {
                     let a = s.get("args").cloned().unwrap_or(Value::Null);
                     steps.push((tool, a));
                 }
-                // Execute via bounded_sequence logic (reuse treatment.rs if available, else direct)
-                // For minimal, use registry.execute_sequence
-                let res = reg.execute_sequence(steps.clone(), false).await;
+                // Execute via bounded_sequence logic (reuse treatment.rs if available, else direct).
+                // Explicit trusted-local calls: no HTTP admission on this path.
+                let contracted: Vec<ContractedCall> = steps
+                    .iter()
+                    .map(|(tool, a)| ContractedCall::local(&reg, tool, a.clone()))
+                    .collect();
+                let res = reg.execute_sequence(contracted, false).await;
                 // Build compact result
                 let mut per_step = Vec::new();
                 let mut success = true;

@@ -47,6 +47,7 @@ pub mod code;
 pub mod destination;
 pub mod egress;
 pub mod error;
+pub mod execution;
 /// The validation harness used to produce `validation/`.
 ///
 /// Behind the `experiment` feature: it is a research artifact, and shipping it
@@ -82,13 +83,16 @@ pub use destination::{
 };
 pub use egress::{EgressError, EgressPolicy};
 pub use error::ToolError;
+pub use execution::{ExecutionContract, ExecutionScope, ADHOC_POLICY_IDENTITY};
 pub use fs::FileSystemTool;
 pub use http::HttpTool;
 pub use limits::Limits;
 pub use policy::ExecutionPolicy;
 pub use ratelimit::{RateLimit, RateLimiter};
 pub use redaction::REDACTION_POLICY_VERSION;
-pub use registry::{ToolDefinition, ToolRegistry};
+pub use registry::{
+    is_idempotency_conflict, ContractedCall, IdempotentOutcome, ToolDefinition, ToolRegistry,
+};
 pub use sandbox::{Sandbox, SandboxError};
 pub use server::ServerConfig;
 pub use shell::{ArgumentPolicy, ShellTool};
@@ -206,9 +210,38 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
+    /// Check arguments against policy *under an execution contract*.
+    ///
+    /// Scope-aware tools (filesystem, shell) enforce the contract's trusted
+    /// scope here; every other tool keeps the default, which is exactly
+    /// [`Tool::validate`]. The contract never travels inside `args`.
+    async fn validate_with(
+        &self,
+        ctx: &crate::ExecutionContract,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let _ = ctx;
+        self.validate(args).await
+    }
+
     /// Run the tool. Implementations must call [`Tool::validate`] themselves,
     /// since a tool may be invoked directly rather than through the registry.
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolOutcome>;
+
+    /// Run the tool under an execution contract.
+    ///
+    /// The default is exactly [`Tool::execute`]: an explicit trusted-local
+    /// run bounded only by the tool's own policy. Scope-aware tools override
+    /// this to enforce `ctx.scope` — caller JSON can never supply scope, so
+    /// the direct-`execute` path cannot manufacture authority by construction.
+    async fn execute_with(
+        &self,
+        ctx: &crate::ExecutionContract,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolOutcome> {
+        let _ = ctx;
+        self.execute(args).await
+    }
 }
 
 #[cfg(test)]

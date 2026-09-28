@@ -1,15 +1,15 @@
 //! Holding tools and dispatching to them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
-use crate::{Tool, ToolOutcome};
+use crate::{ExecutionContract, Tool, ToolOutcome, ADHOC_POLICY_IDENTITY};
 
 /// A tool described for a planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,125 @@ struct CacheEntry {
     inserted: Instant,
 }
 
+/// Replay identity: the caller's idempotency key *plus* the contract's
+/// request fingerprint. A key alone can never name two different executions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplayId {
+    key: String,
+    fingerprint: String,
+}
+
+/// One replay slot: either an executor is running (waiters follow it) or a
+/// completed outcome is available for replay.
+enum ReplayState {
+    InFlight { notify: Arc<Notify> },
+    Done { entry: CacheEntry },
+}
+
+/// One idempotent execution: the outcome plus whether it actually ran.
+/// `replayed == true` means this exact execution ran before under the same
+/// key and fingerprint — no new side effect occurred.
+#[derive(Debug, Clone)]
+pub struct IdempotentOutcome {
+    /// The executed (or replayed) outcome.
+    pub outcome: ToolOutcome,
+    /// True when served from a previous execution rather than run now.
+    pub replayed: bool,
+}
+
+/// A tool call bound to its execution contract: the unit the coordinator
+/// admits and the registry runs. Batch and sequence items travel as these so
+/// scope, replay identity and audit identity stay attached to the same
+/// execution instead of being reconstructed per layer.
+#[derive(Debug, Clone)]
+pub struct ContractedCall {
+    /// Invocation name.
+    pub tool: String,
+    /// Caller arguments (requested work only — never trusted authority).
+    pub args: Value,
+    /// The admitted execution this call runs under.
+    pub contract: ExecutionContract,
+}
+
+impl ContractedCall {
+    /// Bind a call to an admitted contract.
+    pub fn new(tool: String, args: Value, contract: ExecutionContract) -> Self {
+        ContractedCall {
+            tool,
+            args,
+            contract,
+        }
+    }
+
+    /// Explicit trusted-local call for direct library use without HTTP
+    /// admission: a fresh id, Workspace scope, and this registry's policy
+    /// identity. The Workspace scope is stated, not defaulted.
+    pub fn local(registry: &ToolRegistry, tool: &str, args: Value) -> Self {
+        let contract = ExecutionContract::local(tool, &args, registry.policy_identity());
+        ContractedCall::new(tool.to_string(), args, contract)
+    }
+}
+
+/// Whether an error is an idempotency conflict (same key, different
+/// fingerprint). The coordinator maps this to HTTP 409; the code extraction
+/// picks up the `idempotency_conflict` prefix everywhere else.
+pub fn is_idempotency_conflict(err: &anyhow::Error) -> bool {
+    err.to_string().starts_with("idempotency_conflict")
+}
+
+fn idempotency_conflict(key: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "idempotency_conflict: key `{key}` was already admitted for a different execution"
+    )
+}
+
+/// Removes an in-flight replay marker unless the executor completed.
+///
+/// The guard owns no lock: cleanup re-locks briefly in `drop`, so a panic
+/// inside tool execution or an abort of the executor future still removes
+/// the marker and wakes waiters instead of wedging them. `disarm` is called
+/// once the `Done` entry is inserted, so a completed execution is never
+/// removed by its own guard.
+struct InflightGuard<'a> {
+    map: &'a StdMutex<HashMap<ReplayId, ReplayState>>,
+    id: ReplayId,
+    notify: Arc<Notify>,
+    disarmed: bool,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn new(
+        map: &'a StdMutex<HashMap<ReplayId, ReplayState>>,
+        id: ReplayId,
+        notify: Arc<Notify>,
+    ) -> Self {
+        InflightGuard {
+            map,
+            id,
+            notify,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // Never panic in drop: a poisoned or contended lock still wakes
+        // waiters, which re-resolve (and re-execute if the marker survived).
+        if let Ok(mut map) = self.map.lock() {
+            map.remove(&self.id);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 1024;
 
@@ -60,9 +179,14 @@ impl<T: 'static> Drop for AbortOnDrop<T> {
 /// The set of tools an agent may call.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
-    completed: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    completed: Arc<StdMutex<HashMap<ReplayId, ReplayState>>>,
     cache_ttl: Duration,
     cache_max_entries: usize,
+    /// Identity of the policy snapshot this registry was built from: the
+    /// content hash of the effective policy, or [`ADHOC_POLICY_IDENTITY`]
+    /// for hand-built registries. Copied into every admitted contract and
+    /// recorded in audit.
+    policy_identity: String,
 }
 
 impl Default for ToolRegistry {
@@ -73,13 +197,29 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     /// An empty registry. Nothing is callable until something is registered.
+    /// The policy identity marks ad-hoc construction; server-built
+    /// registries carry the effective policy's content hash instead.
     pub fn new() -> Self {
         ToolRegistry {
             tools: HashMap::new(),
-            completed: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(StdMutex::new(HashMap::new())),
             cache_ttl: DEFAULT_CACHE_TTL,
             cache_max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+            policy_identity: ADHOC_POLICY_IDENTITY.to_string(),
         }
+    }
+
+    /// Identity of the policy snapshot backing this registry.
+    pub fn policy_identity(&self) -> &str {
+        &self.policy_identity
+    }
+
+    /// Set the policy identity (content hash of the effective policy).
+    /// Used by the server when building from a policy file; direct library
+    /// users keep the ad-hoc marker.
+    pub fn with_policy_identity(mut self, identity: String) -> Self {
+        self.policy_identity = identity;
+        self
     }
 
     /// Set cache TTL for `execute_once`.
@@ -94,18 +234,64 @@ impl ToolRegistry {
         self
     }
 
-    /// Clear expired entries; evict oldest if over capacity.
-    async fn evict_expired(&self, map: &mut HashMap<String, CacheEntry>) {
+    /// Purge expired completed outcomes and report replay bookkeeping in a
+    /// single pass: whether another fingerprint already claims `key`
+    /// (a conflict, whether Done or still in flight) and how many completed
+    /// outcomes are cached. In-flight markers are never purged or counted:
+    /// evicting one would strand its waiters into becoming parallel
+    /// executors and duplicate the side effect.
+    ///
+    /// The mutex is a plain `std` mutex: every critical section is
+    /// synchronous map work, and it is never held across tool execution.
+    fn purge_and_count(
+        &self,
+        map: &mut HashMap<ReplayId, ReplayState>,
+        key: &str,
+        fingerprint: &str,
+    ) -> (bool, usize) {
         let now = Instant::now();
-        map.retain(|_, e| now.duration_since(e.inserted) < self.cache_ttl);
-        if map.len() > self.cache_max_entries {
-            // evict arbitrary (HashMap) entries until under limit - LRU would
-            // need `lru` dep; this bounds memory which is the P0 requirement.
-            let to_remove = map.len() - self.cache_max_entries;
-            let keys: Vec<String> = map.keys().take(to_remove).cloned().collect();
-            for k in keys {
-                map.remove(&k);
+        let mut conflict = false;
+        let mut done_count = 0usize;
+        map.retain(|e, s| match s {
+            ReplayState::Done { entry } => {
+                if now.duration_since(entry.inserted) >= self.cache_ttl {
+                    return false;
+                }
+                done_count += 1;
+                if e.key == key && e.fingerprint != fingerprint {
+                    conflict = true;
+                }
+                true
             }
+            ReplayState::InFlight { .. } => {
+                if e.key == key && e.fingerprint != fingerprint {
+                    conflict = true;
+                }
+                true
+            }
+        });
+        (conflict, done_count)
+    }
+
+    /// Evict the oldest completed outcomes until `excess` slots are free.
+    /// In-flight markers are load-bearing for single-flight and are never
+    /// evicted; they are bounded by live concurrency and removed
+    /// deterministically when the executor finishes, fails, panics or is
+    /// cancelled.
+    fn evict_oldest_done(&self, map: &mut HashMap<ReplayId, ReplayState>, excess: usize) {
+        if excess == 0 {
+            return;
+        }
+        let mut done: Vec<(ReplayId, Instant)> = map
+            .iter()
+            .filter_map(|(id, s)| match s {
+                ReplayState::Done { entry } => Some((id.clone(), entry.inserted)),
+                ReplayState::InFlight { .. } => None,
+            })
+            .collect();
+        done.sort_by_key(|(_, inserted)| *inserted);
+        for (id, _) in done.into_iter().take(excess) {
+            map.remove(&id);
         }
     }
 
@@ -168,51 +354,171 @@ impl ToolRegistry {
         outcome
     }
 
-    /// Run a tool once per `key`, returning the cached outcome on repeat calls.
+    /// Validate and run a tool under an execution contract.
     ///
-    /// For retrying a step whose tool has a side effect. The cache is in-memory
-    /// and per-process: it does not survive a restart, so it protects against a
-    /// retried step, not against a crashed one.
-    ///
-    /// Only successful calls are cached. A failure that is cached would make a
-    /// transient outage permanent for the lifetime of the process.
-    pub async fn execute_once(&self, key: &str, name: &str, args: Value) -> Result<ToolOutcome> {
-        // Single mutex guards check+insert to close RwLock read->write race where
-        // N concurrent callers all miss then all execute.
-        let mut map = self.completed.lock().await;
-        self.evict_expired(&mut map).await;
-        if let Some(entry) = map.get(key) {
-            tracing::debug!(tool = %name, key = %key, "idempotency cache hit");
-            return Ok(entry.outcome.clone());
-        }
-        drop(map);
+    /// The contract's trusted scope is enforced at the tool boundary;
+    /// caller arguments never carry authority. This is the only path the
+    /// coordinator uses — [`ToolRegistry::execute`] stays as the explicit
+    /// trusted-local entry point for direct library callers.
+    pub async fn execute_with(
+        &self,
+        ctx: &ExecutionContract,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolOutcome> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("tool_not_found: {name}"))?;
 
-        let outcome = self.execute(name, args).await?;
-        if outcome.success {
-            let mut map = self.completed.lock().await;
-            self.evict_expired(&mut map).await;
-            // second check: another task may have inserted while we executed
-            if let Some(entry) = map.get(key) {
-                return Ok(entry.outcome.clone());
-            }
-            map.insert(
-                key.to_string(),
-                CacheEntry {
-                    outcome: outcome.clone(),
-                    inserted: Instant::now(),
-                },
-            );
-            // Ensure we never exceed capacity (evict_expired was before insert)
-            if map.len() > self.cache_max_entries {
-                self.evict_expired(&mut map).await;
-            }
+        // Validate here as well as inside the tool: a tool may be called
+        // directly, and policy must hold on both paths.
+        tool.validate_with(ctx, &args).await?;
+
+        let outcome = tool.execute_with(ctx, args).await;
+        match &outcome {
+            Ok(o) => tracing::info!(
+                tool = %name, success = o.success, duration_ms = o.duration_ms, "tool executed"
+            ),
+            Err(e) => tracing::warn!(tool = %name, error = %e, "tool rejected"),
         }
-        Ok(outcome)
+        outcome
     }
 
-    /// Execute a batch of tool calls concurrently, preserving order.
+    /// Run a tool once per (`key`, request fingerprint), returning the prior
+    /// outcome on identical retries and a stable conflict — without running
+    /// anything — when the same key names a different execution.
     ///
-    /// Each entry is `(name, args)`. Concurrency is bounded by `max_concurrency`
+    /// For retrying a step whose tool has a side effect. The cache is
+    /// in-memory and per-process: it does not survive a restart, so it
+    /// protects against a retried step, not against a crashed one.
+    ///
+    /// Single-flight: exactly one caller becomes the executor for a
+    /// key/fingerprint; concurrent identical callers await that result
+    /// instead of duplicating the side effect. Different keys stay fully
+    /// concurrent, and the map mutex is only ever held for synchronous map
+    /// work — never across tool execution.
+    ///
+    /// Only successful calls are cached. A failure (or tool error) removes
+    /// the in-flight marker and wakes waiters, which retry as new executors —
+    /// the pre-existing failure-retry semantics, unchanged.
+    pub async fn execute_once(
+        &self,
+        key: &str,
+        ctx: &ExecutionContract,
+        name: &str,
+        args: Value,
+    ) -> Result<IdempotentOutcome> {
+        let id = ReplayId {
+            key: key.to_string(),
+            fingerprint: ctx.request_fingerprint.clone(),
+        };
+        // Resolve to executor or follower. Executors break out holding the
+        // new slot's notify; followers subscribe, re-check, and await.
+        let executor_notify: Arc<Notify> = loop {
+            let waiter = {
+                let mut map = self.completed.lock().unwrap();
+                let (conflict, _) = self.purge_and_count(&mut map, &id.key, &id.fingerprint);
+                // Same key, different fingerprint — Done or in flight — is a
+                // different execution: fail before running anything.
+                if conflict {
+                    return Err(idempotency_conflict(key));
+                }
+                match map.get(&id) {
+                    Some(ReplayState::Done { entry }) => {
+                        return Ok(IdempotentOutcome {
+                            outcome: entry.outcome.clone(),
+                            replayed: true,
+                        });
+                    }
+                    Some(ReplayState::InFlight { notify }) => Some(notify.clone()),
+                    None => {
+                        let notify = Arc::new(Notify::new());
+                        map.insert(
+                            id.clone(),
+                            ReplayState::InFlight {
+                                notify: notify.clone(),
+                            },
+                        );
+                        break notify;
+                    }
+                }
+            };
+            // Follower: the executor breaks out of the loop above.
+            let notify = waiter.expect("executor breaks out of the loop");
+            // Subscribe before re-checking so a completion landing in
+            // between cannot be missed (no lost wakeup).
+            tokio::pin! {
+                let notified = notify.notified();
+            }
+            notified.as_mut().enable();
+            let done = {
+                let map = self.completed.lock().unwrap();
+                match map.get(&id) {
+                    Some(ReplayState::Done { entry }) => Some(entry.outcome.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(outcome) = done {
+                return Ok(IdempotentOutcome {
+                    outcome,
+                    replayed: true,
+                });
+            }
+            notified.await;
+            // Executor finished, failed, panicked or was cancelled: loop and
+            // re-resolve (replay, follow a new executor, or execute).
+        };
+
+        // Executor: the map mutex is not held from here until completion.
+        let mut guard = InflightGuard::new(&self.completed, id.clone(), executor_notify.clone());
+        let outcome = self.execute_with(ctx, name, args).await;
+        match outcome {
+            Ok(o) if o.success => {
+                {
+                    let mut map = self.completed.lock().unwrap();
+                    let (_, done_count) = self.purge_and_count(&mut map, &id.key, &id.fingerprint);
+                    // Make room before inserting: the post-insert count is
+                    // then exactly within capacity (the new entry is the
+                    // newest, so oldest-first eviction never takes it).
+                    let excess = (done_count + 1).saturating_sub(self.cache_max_entries);
+                    self.evict_oldest_done(&mut map, excess);
+                    map.insert(
+                        id,
+                        ReplayState::Done {
+                            entry: CacheEntry {
+                                outcome: o.clone(),
+                                inserted: Instant::now(),
+                            },
+                        },
+                    );
+                }
+                guard.disarm();
+                executor_notify.notify_waiters();
+                Ok(IdempotentOutcome {
+                    outcome: o,
+                    replayed: false,
+                })
+            }
+            other => {
+                // Failure or tool error: never cached. Dropping the guard
+                // removes the in-flight marker and wakes waiters, which
+                // retry as new executors.
+                drop(guard);
+                match other {
+                    Ok(o) => Ok(IdempotentOutcome {
+                        outcome: o,
+                        replayed: false,
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Execute a batch of contracted calls concurrently, preserving order.
+    ///
+    /// Concurrency is bounded by `max_concurrency`
     /// (cap of 32 mirrors `marshalld` pool). Useful for agent batch steps like
     /// `read N files` without serial RTT.
     ///
@@ -231,7 +537,7 @@ impl ToolRegistry {
     /// hence released on success, tool error, panic and abort alike.
     pub async fn execute_batch(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<ContractedCall>,
         max_concurrency: usize,
         workload: &Arc<tokio::sync::Semaphore>,
     ) -> Vec<Result<ToolOutcome>> {
@@ -247,13 +553,14 @@ impl ToolRegistry {
         let n = requests.len();
         let mut set = tokio::task::JoinSet::new();
         let mut slot_of = std::collections::HashMap::new();
-        for (index, (name, args)) in requests.into_iter().enumerate() {
+        for (index, call) in requests.into_iter().enumerate() {
             let local = local.clone();
             let workload = workload.clone();
             // Clone registry internals via Arc self? We need `self` to be Sync.
             // Since `&self` is shared, we spawn a task that holds a cloned reference
             // to the needed tool Arc.
-            let tool = self.tools.get(&name).cloned();
+            let tool = self.tools.get(&call.tool).cloned();
+            let name = call.tool.clone();
             let handle = set.spawn(async move {
                 // Local slot first, then global workload permit: a single global
                 // order, so waiters can never deadlock against each other.
@@ -261,8 +568,8 @@ impl ToolRegistry {
                 let _slot = local.acquire_owned().await.unwrap();
                 let _work = workload.acquire_owned().await.unwrap();
                 let outcome = if let Some(tool) = tool {
-                    match tool.validate(&args).await {
-                        Ok(()) => tool.execute(args).await,
+                    match tool.validate_with(&call.contract, &call.args).await {
+                        Ok(()) => tool.execute_with(&call.contract, call.args).await,
                         Err(e) => Err(e),
                     }
                 } else {
@@ -308,18 +615,25 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Execute a sequence of tool calls **in order**, stopping on first error
-    /// unless `continue_on_error` is true. Unlike `execute_batch` which runs
-    /// concurrently, this preserves strict ordering and allows an agent to
-    /// express `write -> read -> shell` workflows without extra RTTs.
+    /// Execute a sequence of contracted calls **in order**, stopping on first
+    /// error unless `continue_on_error` is true. Unlike `execute_batch` which
+    /// runs concurrently, this preserves strict ordering and allows an agent
+    /// to express `write -> read -> shell` workflows without extra RTTs.
     ///
-    /// Each step is `(name, args)`. Supports templating `{{steps[0].stdout}}`
-    /// where `steps[N].stdout`/`content` is previous stdout as UTF-8, `summary`
-    /// is JSON. Returns results in input order; if `stop_on_error` (default
-    /// `true`) a failed `Err` or `success==false` outcome aborts remaining steps.
+    /// Supports templating `{{steps[0].stdout}}` where `steps[N].stdout`/
+    /// `content` is previous stdout as UTF-8, `summary` is JSON. Templating
+    /// resolves caller data only: every step already carries its contract,
+    /// and the tool enforces that contract on the *resolved* values at the
+    /// execution boundary — a dynamically generated path gets no more
+    /// authority than the contract attached to its step. (The replay
+    /// fingerprint is bound at admission on the unexpanded step; sequence
+    /// steps are not idempotent across calls.)
+    ///
+    /// Returns results in input order; if `stop_on_error` (default `true`) a
+    /// failed `Err` or `success==false` outcome aborts remaining steps.
     pub async fn execute_sequence(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<ContractedCall>,
         continue_on_error: bool,
     ) -> Vec<Result<ToolOutcome>> {
         if requests.len() > 32 {
@@ -330,9 +644,10 @@ impl ToolRegistry {
         }
         let mut results = Vec::with_capacity(requests.len());
         let mut prev_outcomes: Vec<ToolOutcome> = Vec::new();
-        for (name, args) in requests {
-            let templated = apply_templates(&args, &prev_outcomes);
-            let res = self.execute(&name, templated).await;
+        for call in requests {
+            let templated = apply_templates(&call.args, &prev_outcomes);
+            let name = call.tool.clone();
+            let res = self.execute_with(&call.contract, &name, templated).await;
             let placeholder = match &res {
                 Ok(o) => o.clone(),
                 Err(e) => ToolOutcome::failure(
@@ -357,7 +672,7 @@ impl ToolRegistry {
 
     /// Number of cached idempotency entries (for testing/metrics).
     pub async fn cache_len(&self) -> usize {
-        self.completed.lock().await.len()
+        self.completed.lock().unwrap().len()
     }
 }
 
@@ -481,6 +796,14 @@ mod tests {
         (registry, tool)
     }
 
+    fn call(reg: &ToolRegistry, tool: &str, args: Value) -> ContractedCall {
+        ContractedCall::local(reg, tool, args)
+    }
+
+    fn ctx(reg: &ToolRegistry, tool: &str, args: &Value) -> ExecutionContract {
+        ExecutionContract::local(tool, args, reg.policy_identity())
+    }
+
     /// A tool that sleeps `args["ms"]` while recording peak concurrency.
     struct Sleeper {
         current: Arc<AtomicUsize>,
@@ -524,9 +847,9 @@ mod tests {
         (registry, tool)
     }
 
-    fn sleep_reqs(n: usize, ms: u64) -> Vec<(String, Value)> {
+    fn sleep_reqs(reg: &ToolRegistry, n: usize, ms: u64) -> Vec<ContractedCall> {
         (0..n)
-            .map(|_| ("sleeper".to_string(), json!({"ms": ms})))
+            .map(|_| call(reg, "sleeper", json!({"ms": ms})))
             .collect()
     }
 
@@ -537,7 +860,7 @@ mod tests {
         let workload = Arc::new(tokio::sync::Semaphore::new(1));
         let started = Instant::now();
         let results = registry
-            .execute_batch(sleep_reqs(3, 200), 32, &workload)
+            .execute_batch(sleep_reqs(&registry, 3, 200), 32, &workload)
             .await;
         assert_eq!(results.len(), 3);
         for r in results {
@@ -556,7 +879,7 @@ mod tests {
         let workload = Arc::new(tokio::sync::Semaphore::new(8));
         let started = Instant::now();
         let results = registry
-            .execute_batch(sleep_reqs(3, 200), 3, &workload)
+            .execute_batch(sleep_reqs(&registry, 3, 200), 3, &workload)
             .await;
         assert!(results.into_iter().all(|r| r.unwrap().success));
         assert_eq!(tool.peak.load(Ordering::SeqCst), 3);
@@ -571,7 +894,7 @@ mod tests {
         let (registry, tool) = sleep_registry();
         let workload = Arc::new(tokio::sync::Semaphore::new(2));
         {
-            let fut = registry.execute_batch(sleep_reqs(4, 500), 4, &workload);
+            let fut = registry.execute_batch(sleep_reqs(&registry, 4, 500), 4, &workload);
             tokio::pin!(fut);
             tokio::select! {
                 _ = &mut fut => panic!("batch finished before the drop"),
@@ -593,9 +916,9 @@ mod tests {
         let (registry, _) = registry(true);
         let workload = Arc::new(tokio::sync::Semaphore::new(2));
         let reqs = vec![
-            ("counter".to_string(), json!({})),
-            ("nope".to_string(), json!({})),
-            ("counter".to_string(), json!({"bad": true})),
+            call(&registry, "counter", json!({})),
+            call(&registry, "nope", json!({})),
+            call(&registry, "counter", json!({"bad": true})),
         ];
         let results = registry.execute_batch(reqs, 3, &workload).await;
         assert_eq!(results.len(), 3);
@@ -632,10 +955,16 @@ mod tests {
     async fn execute_once_runs_a_tool_only_once() {
         let (registry, tool) = registry(true);
         for _ in 0..5 {
-            registry
-                .execute_once("k1", "counter", json!({}))
+            let outcome = registry
+                .execute_once(
+                    "k1",
+                    &ctx(&registry, "counter", &json!({})),
+                    "counter",
+                    json!({}),
+                )
                 .await
                 .unwrap();
+            assert!(!outcome.replayed || tool.calls.load(Ordering::SeqCst) == 1);
         }
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     }
@@ -643,14 +972,18 @@ mod tests {
     #[tokio::test]
     async fn different_keys_run_separately() {
         let (registry, tool) = registry(true);
-        registry
-            .execute_once("a", "counter", json!({}))
-            .await
-            .unwrap();
-        registry
-            .execute_once("b", "counter", json!({}))
-            .await
-            .unwrap();
+        for key in ["a", "b"] {
+            let outcome = registry
+                .execute_once(
+                    key,
+                    &ctx(&registry, "counter", &json!({})),
+                    "counter",
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            assert!(!outcome.replayed);
+        }
         assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
     }
 
@@ -660,12 +993,103 @@ mod tests {
         let (registry, tool) = registry(false);
         for _ in 0..3 {
             let outcome = registry
-                .execute_once("k", "counter", json!({}))
+                .execute_once(
+                    "k",
+                    &ctx(&registry, "counter", &json!({})),
+                    "counter",
+                    json!({}),
+                )
                 .await
                 .unwrap();
-            assert!(!outcome.success);
+            assert!(!outcome.replayed);
+            assert!(!outcome.outcome.success);
         }
         assert_eq!(tool.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn same_key_different_fingerprint_conflicts_without_executing() {
+        let (registry, tool) = registry(true);
+        registry
+            .execute_once(
+                "k",
+                &ctx(&registry, "counter", &json!({"v": 1})),
+                "counter",
+                json!({"v": 1}),
+            )
+            .await
+            .unwrap();
+        let err = registry
+            .execute_once(
+                "k",
+                &ctx(&registry, "counter", &json!({"v": 2})),
+                "counter",
+                json!({"v": 2}),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_idempotency_conflict(&err), "{err}");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_executor_releases_waiters_to_retry() {
+        // The tool sleeps; abort the executor mid-flight. The waiter must
+        // wake and complete the work itself — never hang — and exactly one
+        // execution runs in total. The count increments after the sleep so
+        // an aborted executor cannot count.
+        struct Slow {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for Slow {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "slow"
+            }
+            fn parameters_schema(&self) -> Value {
+                json!({})
+            }
+            async fn execute(&self, _args: Value) -> Result<ToolOutcome> {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutcome::success("slow", json!({}), 0))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Slow {
+            calls: calls.clone(),
+        }));
+        let registry = Arc::new(registry);
+
+        let r1 = registry.clone();
+        let executor = tokio::spawn(async move {
+            let c = ExecutionContract::local("slow", &json!({}), r1.policy_identity());
+            r1.execute_once("k", &c, "slow", json!({})).await
+        });
+        // Let the executor pass admission and block inside the tool.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r2 = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let c = ExecutionContract::local("slow", &json!({}), r2.policy_identity());
+            r2.execute_once("k", &c, "slow", json!({})).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        executor.abort();
+        let settled = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter wedged after executor cancellation")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !settled.replayed,
+            "waiter should have executed, not replayed"
+        );
+        assert!(settled.outcome.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -692,9 +1116,9 @@ mod tests {
     async fn batch_executes_concurrently_and_preserves_order() {
         let (registry, tool) = registry(true);
         let reqs = vec![
-            ("counter".to_string(), json!({})),
-            ("counter".to_string(), json!({})),
-            ("counter".to_string(), json!({})),
+            call(&registry, "counter", json!({})),
+            call(&registry, "counter", json!({})),
+            call(&registry, "counter", json!({})),
         ];
         let workload = Arc::new(tokio::sync::Semaphore::new(8));
         let results = registry.execute_batch(reqs, 2, &workload).await;
@@ -708,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn batch_reports_missing_tool_as_error() {
         let (registry, _) = registry(true);
-        let reqs = vec![("nope".to_string(), json!({}))];
+        let reqs = vec![call(&registry, "nope", json!({}))];
         let workload = Arc::new(tokio::sync::Semaphore::new(8));
         let results = registry.execute_batch(reqs, 4, &workload).await;
         assert!(results[0].is_err());
@@ -730,9 +1154,9 @@ mod tests {
     async fn sequence_executes_in_order_and_stops_on_error() {
         let (registry, tool) = registry(true);
         let reqs = vec![
-            ("counter".to_string(), json!({})),
-            ("counter".to_string(), json!({"bad": 1})),
-            ("counter".to_string(), json!({})),
+            call(&registry, "counter", json!({})),
+            call(&registry, "counter", json!({"bad": 1})),
+            call(&registry, "counter", json!({})),
         ];
         let results = registry.execute_sequence(reqs, false).await;
         // second fails validation -> stops, third never runs
@@ -746,9 +1170,9 @@ mod tests {
     async fn sequence_continues_when_requested() {
         let (registry, tool) = registry(true);
         let reqs = vec![
-            ("counter".to_string(), json!({})),
-            ("counter".to_string(), json!({"bad": 1})),
-            ("counter".to_string(), json!({})),
+            call(&registry, "counter", json!({})),
+            call(&registry, "counter", json!({"bad": 1})),
+            call(&registry, "counter", json!({})),
         ];
         let results = registry.execute_sequence(reqs, true).await;
         assert_eq!(results.len(), 3);
@@ -784,11 +1208,8 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(std::sync::Arc::new(Echo));
         let steps = vec![
-            ("echo".to_string(), json!({"msg": "hello"})),
-            (
-                "echo".to_string(),
-                json!({"msg": "{{steps[0].stdout}} world"}),
-            ),
+            ContractedCall::local(&reg, "echo", json!({"msg": "hello"})),
+            ContractedCall::local(&reg, "echo", json!({"msg": "{{steps[0].stdout}} world"})),
         ];
         let res = reg.execute_sequence(steps, false).await;
         assert_eq!(res.len(), 2);
