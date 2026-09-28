@@ -92,12 +92,28 @@ authoritative for vulnerabilities, deny for bans/licenses/sources.
   preserved (wasmtime 36 rust-version 1.86). Migration diff: one trait
   signature + one cancellation guard; adversarial suite extended and green
   on both platforms.
-- Residual warnings (CI `--deny warnings` stays red on these two only):
+- Residual warnings at the time (eliminated by the PR #14 supply-chain
+  closure entry below; the `r-efi` path suspected here was also wrong —
+  `r-efi 6.0.0` is a leaf with no `chacha20` edge; the real lock path was
+  `reqwest --(optional http3, not enabled)--> quinn → quinn-proto → rand`):
   `fxhash` (unmaintained) via `fxprof-processed-profile` ← wasmtime
   (profiler never enabled); `chacha20` (yanked) via `r-efi` ← `getrandom`
   (UEFI-target fallback, unreachable on Linux/macOS). Neither is referenced
   by Marshall code; neither is removable compatibly. No suppression added.
 - Not suppressed: no `ignore` entries added to `deny.toml`, no audit
   exclusions.
+- Applied (PR #14 supply-chain closure): wasmtime `36.0.16` moved from
+  default features to `default-features = false` with
+  `cranelift,runtime,std,wat`; the `config.async_support(false)` call was
+  removed from `src/backend.rs` (synchronous execution is the default with
+  the `async` feature off, so the setter was a no-op). `cargo audit --deny
+  warnings` exits 0 on the committed lock (343 → 304 entries, pure removal
+  plus one compatible bump): `fxprof-processed-profile` + `fxhash` and 37
+  other wasmtime-default-only crates (profiling, parallel-compilation,
+  component-model, winch, cache/zstd, demangle stacks) left the graph, and
+  `chacha20 0.10.1` (yanked) → `0.10.2` via narrow
+  `cargo update -p chacha20 --precise 0.10.2`. MSRV 1.88 and the
+  WasmBackend adversarial suite remain green (10 lib tests plus a
+  throwaway 4096→64-byte stdout/stderr caps probe, removed after use).
 - Restriction lifted for `wasm` subject to the remaining notes below; the
   `ContainerBackend` fail-closed posture is unchanged.

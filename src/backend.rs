@@ -413,7 +413,8 @@ async fn execute_wasm(
     let mut config = Config::new();
     config.consume_fuel(effective_fuel.is_some());
     config.epoch_interruption(true);
-    config.async_support(false);
+    // Async execution is disabled by not enabling wasmtime's `async`
+    // feature (synchronous execution is the default); no setter needed.
     let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
 
     let module = Module::new(&engine, &wasm_bytes).map_err(|e| anyhow::anyhow!("module: {e}"))?;

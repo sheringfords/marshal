@@ -75,7 +75,9 @@ otherwise.
 ## Sequencing (small PRs, each independently testable)
 
 1. Coordinator extraction behind the existing handlers (no behavior change;
-   gate: 59 server tests green).
+   gate: 59 server tests green). **Implemented in Slice 1
+   (`prepare_one`/`preflight_all`/`run_one`/`record_outcome`; 74 server
+   tests green, including 15 new characterization tests).**
 2. `ExecCtx` introduction with blanket-impl migration (gate: scope tests
    green, JSON key gone from args).
 3. `WorkloadGuard` unification (gate: M2-001 timing tests green).

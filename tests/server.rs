@@ -2037,3 +2037,445 @@ shell:
     assert_eq!(step1["success"], false, "{step1}");
     assert_eq!(step1["code"], "path_not_allowed", "{step1}");
 }
+
+// ── coordinator characterization (V2-S1): pin endpoint behavior ──
+// These tests pin the CURRENT contract before the coordinator refactor.
+// Each asserts existing behavior; none encodes new semantics.
+
+fn audit_lines(path: &std::path::Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("audit json"))
+        .collect()
+}
+
+fn app_with_audit(ws: &Workspace) -> (Router, PathBuf) {
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with(ServerConfig {
+        audit_path: Some(audit_path.clone()),
+        ..ws.config()
+    });
+    (app, audit_path)
+}
+
+#[tokio::test]
+async fn oversize_sequence_is_refused_before_it_runs() {
+    let ws = Workspace::new("char-oversize-seq");
+    let (app, audit_path) = app_with_audit(&ws);
+    let steps: Vec<Value> = (0..33)
+        .map(|_| execute("system", json!({"operation": "now"})))
+        .collect();
+    let (status, body) = send(&app, post("/v1/execute/sequence", json!({"steps": steps}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "sequence_too_large");
+    assert!(audit_lines(&audit_path).is_empty());
+}
+
+#[tokio::test]
+async fn unknown_session_code_is_consistent_across_endpoints() {
+    let ws = Workspace::new("char-unknown-sid");
+    let app = ws.app();
+    let sid = "00000000-0000-0000-0000-000000000000";
+    for (uri, body) in endpoint_bodies(
+        "filesystem",
+        json!({"operation": "list", "path": ws.root}),
+        Some(sid),
+    ) {
+        let (status, text) = send_text(&app, post(uri, body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(text.contains("session_not_found"), "{uri}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn expired_session_code_is_consistent_across_endpoints() {
+    let ws = Workspace::new("char-expired-sid");
+    let app = ws.app_with(ServerConfig {
+        session_ttl: Some(Duration::from_millis(1)),
+        ..ws.config()
+    });
+    let (_, body) = send(&app, post("/v1/sessions", json!({}))).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    for (uri, req_body) in endpoint_bodies(
+        "filesystem",
+        json!({"operation": "list", "path": ws.root}),
+        Some(&sid),
+    ) {
+        let (status, text) = send_text(&app, post(uri, req_body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(
+            text.contains("session_expired") || text.contains("session_not_found"),
+            "{uri}: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn blocked_http_destination_is_refused_on_batch_and_sequence() {
+    let ws = Workspace::new("char-egress-multi");
+    let app = ws.app();
+    let args = json!({"url": "https://169.254.169.254/latest/meta-data/"});
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, body) = send(
+            &app,
+            post(uri, json!({key: [execute("http", args.clone())]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(
+            body["code"], "host resolves to a blocked address",
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_error_event_on_registry_rejection() {
+    let ws = Workspace::new("char-stream-error");
+    let app = ws.app();
+    let (status, text) = send_text(
+        &app,
+        post("/v1/execute/stream", execute("no-such-tool", json!({}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.contains("event: error"), "{text}");
+}
+
+#[tokio::test]
+async fn sse_events_arrive_in_summary_chunk_done_order() {
+    let ws = Workspace::new("char-sse-order");
+    let app = ws.app();
+    let (status, text) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            execute(
+                "shell",
+                json!({"program": echo_path(), "args": ["hello-sse"]}),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("event: "))
+        .collect();
+    assert_eq!(events.first(), Some(&"summary"));
+    assert_eq!(events.last(), Some(&"done"));
+    assert!(events.contains(&"chunk"), "{events:?}");
+    // Chunk carries content hash + base64 payload.
+    assert!(text.contains("chunk_b64"), "{text}");
+    assert!(text.contains("sha256"), "{text}");
+}
+
+#[tokio::test]
+async fn denied_batch_and_sequence_preflight_writes_no_audit() {
+    let ws = Workspace::new("char-preflight-purity");
+    let (app, audit_path) = app_with_audit(&ws);
+    let bad_sid = "00000000-0000-0000-0000-000000000000";
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, _) = send(
+            &app,
+            post(
+                uri,
+                json!({
+                    "session_id": bad_sid,
+                    key: [execute("system", json!({"operation": "now"}))],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    // Oversize batch likewise runs nothing.
+    let big: Vec<Value> = (0..65)
+        .map(|_| execute("system", json!({"operation": "now"})))
+        .collect();
+    let (status, _) = send(&app, post("/v1/execute/batch", json!({"requests": big}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(audit_lines(&audit_path).is_empty());
+    let (_, metrics) = send_text(&app, get("/metrics")).await;
+    assert!(
+        !metrics.contains("marshalld_tool_requests_total"),
+        "denied preflight must not mint per-tool series: {metrics}"
+    );
+}
+
+#[tokio::test]
+async fn forged_scope_key_is_ignored_on_all_endpoints() {
+    let ws = Workspace::new("char-forged-scope");
+    std::fs::write(ws.path("shared.txt"), "not yours").unwrap();
+    let app = ws.app();
+    let (sid, _) = make_session(&app).await;
+    // A forged root of "/" must not widen access: the outside read still fails.
+    let forged = json!({
+        "operation": "read",
+        "path": ws.path("shared.txt"),
+        "__session_root": "/",
+    });
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({"tool": "filesystem", "session_id": sid, "args": forged.clone()}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "path_not_allowed");
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, _) = send(
+            &app,
+            post(
+                uri,
+                json!({key: [{
+                    "tool": "filesystem", "session_id": sid, "args": forged.clone(),
+                }]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let (status, _) = send_text(
+        &app,
+        post(
+            "/v1/execute/stream",
+            json!({"tool": "filesystem", "session_id": sid, "args": forged}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn per_item_session_denials_without_top_level() {
+    let ws = Workspace::new("char-per-item-sid");
+    let app = ws.app();
+    // Unknown per-item session, no top-level: whole-request 404 on both.
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, body) = send(
+            &app,
+            post(
+                uri,
+                json!({key: [{
+                    "tool": "system",
+                    "session_id": "00000000-0000-0000-0000-000000000000",
+                    "args": {"operation": "now"},
+                }]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(body["code"], "session_not_found", "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn empty_batch_and_sequence_reject_bad_top_level_session() {
+    let ws = Workspace::new("char-empty-top");
+    let app = ws.app();
+    let bad_sid = "00000000-0000-0000-0000-000000000000";
+    for (uri, key) in [
+        ("/v1/execute/batch", "requests"),
+        ("/v1/execute/sequence", "steps"),
+    ] {
+        let (status, body) = send(&app, post(uri, json!({"session_id": bad_sid, key: []}))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(body["code"], "session_not_found", "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn partial_batch_records_one_audit_line_and_mixed_metrics() {
+    let ws = Workspace::new("char-partial-audit");
+    let (app, audit_path) = app_with_audit(&ws);
+    let echo = echo_path();
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [
+                {"tool": "shell", "args": {"program": echo, "args": ["ok"]}},
+                {"tool": "no-such-tool", "args": {}},
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcomes"][0]["success"], true);
+    assert!(body["outcomes"][1].get("error").is_some(), "{body}");
+    let lines = audit_lines(&audit_path);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let (_, metrics) = send_text(&app, get("/metrics")).await;
+    assert!(
+        metrics.contains(r#"marshalld_tool_requests_total{tool="shell",status="success"} 1"#),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn batch_item_error_releases_permits() {
+    // At concurrency 1, a batch containing a failing item must still free
+    // the workload budget for the next request.
+    let ws = Workspace::new("char-permit-error");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute/batch",
+            json!({"requests": [
+                {"tool": "no-such-tool", "args": {}},
+                {"tool": "system", "args": {"operation": "now"}},
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn aborted_sequence_releases_its_permit() {
+    let ws = Workspace::new("char-seq-abort");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+    {
+        let fut = app.clone().oneshot(post(
+            "/v1/execute/sequence",
+            json!({"steps": [
+                {"tool": "system", "args": {"operation": "sleep", "duration_ms": 400}},
+                {"tool": "system", "args": {"operation": "sleep", "duration_ms": 400}},
+            ]}),
+        ));
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("sequence finished before the abort"),
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn edge_rejections_skip_request_count_but_shed_counts() {
+    let ws = Workspace::new("char-request-count");
+    let app = ws.app_with(ServerConfig {
+        concurrency: 1,
+        ..ws.config()
+    });
+    // Edge rejections (401/429) happen before inc_request; admission
+    // rejections (404/403/503) happen after it. Pin the current placement.
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            execute("system", json!({"operation": "now"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        post(
+            "/v1/execute",
+            json!({
+                "tool": "filesystem",
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "args": {"operation": "list", "path": ws.root},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, metrics) = send_text(&app, get("/metrics")).await;
+    assert!(metrics.contains("marshalld_requests_total 2"), "{metrics}");
+    // Saturate the single permit, then shed: shed increments the counter.
+    let slow = app.clone().oneshot(post(
+        "/v1/execute",
+        execute("system", json!({"operation": "sleep", "duration_ms": 400})),
+    ));
+    let contender = async {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send(
+            &app,
+            post(
+                "/v1/execute",
+                execute("system", json!({"operation": "now"})),
+            ),
+        )
+        .await
+    };
+    let (_slow, (status, _)) = tokio::join!(slow, contender);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (_, metrics) = send_text(&app, get("/metrics")).await;
+    assert!(metrics.contains("marshalld_requests_total 4"), "{metrics}");
+}
+
+#[tokio::test]
+async fn templated_inside_path_still_executes() {
+    // Templates skip admission path-checks (they resolve later) but an
+    // in-session resolved value must execute normally.
+    let ws = Workspace::new("char-template-ok");
+    let app = ws.app();
+    let (sid, root) = make_session(&app).await;
+    std::fs::write(root.join("data.txt"), "templated").unwrap();
+    let path = root.join("data.txt").to_string_lossy().into_owned();
+    let (status, body) = send(
+        &app,
+        post(
+            "/v1/execute/sequence",
+            json!({
+                "session_id": sid,
+                "steps": [
+                    {"tool": "shell", "args": {"program": echo_path(), "args": [path]}},
+                    {"tool": "filesystem",
+                     "args": {"operation": "read", "path": "{{steps[0].stdout}}"}},
+                ],
+            }),
+        ),
+    )
+    .await;
+    // echo appends a newline so the templated path is unresolvable: the
+    // step must fail closed, never read outside the session.
+    assert_eq!(status, StatusCode::OK);
+    let step1 = &body["outcomes"][1];
+    assert_eq!(step1["success"], false, "{step1}");
+}
