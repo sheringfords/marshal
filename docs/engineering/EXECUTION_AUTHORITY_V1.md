@@ -52,12 +52,33 @@ No defect below was fixed on inspection alone; each was reproduced.
 
 ```rust
 pub struct ExecutionContract {
-    pub execution_id: String,       // fresh uuid per admitted item
-    pub scope: ExecutionScope,      // Session(PathBuf) | Workspace
-    pub request_fingerprint: String,// sha256 hex, safe to record
-    pub policy_identity: String,    // policy content hash or ad-hoc marker
+    execution_id: String,       // private; read via execution_id()
+    scope: ExecutionScope,      // private; read via scope()
+    request_fingerprint: String,// private; read via request_fingerprint()
+    policy_identity: String,    // private; read via policy_identity()
 }
 ```
+
+Fields are private with read-only accessors; fingerprint minting
+(`fingerprint()`) is private to the module. The only public constructors,
+`admit` and `local`, always derive the fingerprint from exactly the tool,
+arguments and scope they are given, so a contract can never disagree with
+the call it was built for. The registry executes the single
+[`ContractedCall`] unit (tool + args + contract) rather than accepting the
+three independently — `ContractedCall::new` admits the contract internally
+from exactly the tool, arguments and scope the call carries, and the
+contract field itself is private. There is no public constructor that takes
+an independently built contract, and the only argument-substitution path
+(`with_args`, sequence template expansion) is `pub(crate)`. A
+contract/call mismatch is therefore unrepresentable through the public
+API — not validated-away, but inexpressible.
+
+Execution identity vs request occurrence: every admission mints a fresh
+`execution_id` (a carrier for that attempt), but the *execution* identity
+is the origin id — the first actual side effect's id, which every replay
+references. V1 introduces no separate attempt/request identifier: a fresh
+run reports `replayed: false` with its own id as origin; a retry reports
+`replayed: true` with the stored origin id.
 
 Why each field exists (every field has a consumer in this slice):
 
@@ -175,10 +196,15 @@ different keys stay fully concurrent.
 
 `audit_log` records `execution_id`, `request_fingerprint`,
 `policy_identity` (all digests/opaque — payload redaction untouched) and
-`execution_status: "executed" | "replayed"`. Replay lines reuse the
-original execution id, so a cache hit can never be mistaken for a new side
-effect. No tamper-resistance, durability, COMMITTED/UNKNOWN, or
-exactly-once claims (all out of scope).
+`execution_status: "executed" | "replayed"`. The recorded `execution_id`
+is the *originating* id: the executor's id for a fresh run, the stored
+origin id for a replay. A cache hit therefore references the execution
+that actually ran and can never be mistaken for a new side effect — this
+was Finding 1 of the closure review (replays previously minted fresh
+ids); the replay store persists the origin id alongside each completed
+outcome, which is the only additional state replay keeps. No
+tamper-resistance, durability, COMMITTED/UNKNOWN, or exactly-once claims
+(all out of scope).
 
 ## 9. Representation-collapse analysis
 
@@ -194,22 +220,37 @@ Production refs to JSON scope machinery: 29 → 0. Independent identity
 constructions: replay-key-only (+ none + none) → one contract minted once
 per admitted item, consumed by dispatch, replay, and audit.
 
-Diff (excluding new files): `src/` +1064/−414 (registry replay +
-coordinator dominate; fs/shell churn is mechanical scope-threading),
-`tests/` +133/−48 (two semantic updates: key-conflict tests; rest is API
-migration), experiment/bins +46/−~20 (trusted-local wrapping). New:
-`src/execution.rs` (226), `tests/authority.rs` (15 tests, 786).
+Diff (excluding new files): `src/` +1064/−414 for the V1 slice
+(registry replay + coordinator dominate; fs/shell churn is mechanical
+scope-threading), plus +232/−168 for the closure slice (single-unit
+registry APIs, origin-id replay, private contract fields). `tests/`
++133/−48 then +166/−33 (conflict semantics, API migration, origin-id and
+binding tests), experiment/bins trusted-local wrapping. New:
+`src/execution.rs` (226+), `tests/authority.rs` (18 tests).
 
-Impossible states removed by construction: scope that is both present and
-unvalidated (no JSON scope exists to be malformed); replay that names
-different work (identity binds tool+args+scope); audit that mints ids for
-non-executions (replays reuse); waiter stranded by a dead executor (guard
-+ notify); InFlight evicted under waiters (eviction skips them).
+Impossible states removed, each by the API rather than by validation:
+
+- Scope that is both present and unvalidated: no tool reads scope from
+  JSON anywhere (`Scope` enum and key readers deleted; 29 → 0 production
+  references), so there is nothing malformed to fail closed on.
+- Replay that names different work: `execute_once`/`execute_with` take one
+  `ContractedCall` whose fingerprint was derived from exactly its
+  tool/args/scope at construction; no public API accepts an independent
+  fingerprint, contract, or argument set alongside it. (Tool-level
+  `execute_with(ctx, args)` still takes both — deliberately: tools never
+  consume fingerprints, so a skewed pair there cannot corrupt replay
+  identity, which lives only in the registry's single-unit APIs.)
+- Audit that mints ids for non-executions: replays carry the stored
+  origin id; `IdempotentOutcome.execution_id` is the origin in both the
+  executed and replayed cases.
+- Waiter stranded by a dead executor: `InflightGuard` + notify on drop.
+- In-flight entry evicted under waiters: eviction only touches completed
+  outcomes.
 
 ## 10. Verification
 
 Full matrix green on macOS (this slice): fmt; clippy default/wasm/
-experiment; lib 152; server 75; authority 15; escapes 14; toctou 4;
+experiment; lib 152; server 75; authority 18; escapes 14; toctou 4;
 stress; validation 17; wasm lib 161; doc; MSRV 1.88 (default/experiment/
 wasm); Python + JS SDK; `cargo audit --deny warnings` exit 0; `cargo deny
 check` clean; container build + both smoke checks. Linux + final CI run
@@ -232,3 +273,32 @@ explicit `working_dir` inside the session root or reject): it is the one
 remaining path where an execution can act outside its contract without a
 dynamically resolved value. Needs one endpoint-behavior decision (reject
 vs chdir) and a matrix entry update — no new machinery.
+
+## 13. Closure review: two gaps found and closed (same branch)
+
+Independent review of the V1 slice found two places where the authority
+claim outran the implementation. Both were reproduced with throwaway
+probes (deleted after use) before fixing, on this branch.
+
+1. **Replay attribution lost the originating id.** The handler audited
+   replays under the retry's freshly admitted id, so `executed` and
+   `replayed` lines for one side effect carried different ids — and §8
+   above wrongly claimed otherwise. Fix: the replay store persists the
+   executor's id (`Done.origin`, the only added replay state) and
+   `IdempotentOutcome.execution_id` is the origin in both cases; audit
+   records it. Proven by `executed_audit_id_equals_replay_audit_origin_id`
+   and `concurrent_identical_http_retries_share_one_origin_id` (16
+   callers → 1 executed + 15 replayed, one id).
+2. **Contract and call arguments could disagree.** `execute_once(key,
+   ctx, name, args)` accepted three independent representations, and the
+   probe showed a contract admitted for `(alpha, {})` executing
+   `(beta, {x: 1})` — poisoning the cache so an honest alpha retry
+   replayed beta's outcome with alpha running 0×. Fix by deletion, not
+   validation: contract fields are private with accessors, fingerprint
+   minting is module-private, and the registry takes one
+   `ContractedCall` whose contract is admitted internally from exactly
+   its tool/args/scope (`ContractedCall::new`; `local` for trusted-local
+   use; `with_args` is `pub(crate)` for sequence expansion only, where
+   replay identity is never consulted). Proven by
+   `contracted_calls_bind_fingerprint_to_their_own_work` plus the
+   unchanged conflict/origin test battery.

@@ -260,10 +260,9 @@ pub async fn instrument_execute_once(
         input_bytes,
     );
     let started = std::time::Instant::now();
-    // Experiment harness: explicit trusted-local contract, no HTTP admission.
-    let ctx = crate::ExecutionContract::local(tool, &args, registry.policy_identity());
+    // Experiment harness: explicit trusted-local call, no HTTP admission.
     let res = registry
-        .execute_once(key, &ctx, tool, args)
+        .execute_once(key, ContractedCall::local(registry, tool, args))
         .await
         .map(|r| r.outcome);
     let elapsed = started.elapsed().as_millis() as u64;

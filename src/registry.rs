@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use crate::{ExecutionContract, Tool, ToolOutcome, ADHOC_POLICY_IDENTITY};
+use crate::{ExecutionContract, ExecutionScope, Tool, ToolOutcome, ADHOC_POLICY_IDENTITY};
 
 /// A tool described for a planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,8 +50,15 @@ struct ReplayId {
 /// One replay slot: either an executor is running (waiters follow it) or a
 /// completed outcome is available for replay.
 enum ReplayState {
-    InFlight { notify: Arc<Notify> },
-    Done { entry: CacheEntry },
+    InFlight {
+        notify: Arc<Notify>,
+    },
+    /// A completed execution. `origin` is the executor's execution id — the
+    /// minimal attribution replays reference instead of minting fresh ids.
+    Done {
+        entry: CacheEntry,
+        origin: String,
+    },
 }
 
 /// One idempotent execution: the outcome plus whether it actually ran.
@@ -63,12 +70,22 @@ pub struct IdempotentOutcome {
     pub outcome: ToolOutcome,
     /// True when served from a previous execution rather than run now.
     pub replayed: bool,
+    /// Originating execution id: the executor's id, referenced by every
+    /// replay of that completed execution. A replay never mints an id.
+    pub execution_id: String,
 }
 
 /// A tool call bound to its execution contract: the unit the coordinator
 /// admits and the registry runs. Batch and sequence items travel as these so
 /// scope, replay identity and audit identity stay attached to the same
 /// execution instead of being reconstructed per layer.
+///
+/// The contract is admitted inside [`ContractedCall::new`] from exactly the
+/// tool, arguments and scope the call carries — there is no constructor that
+/// accepts an independently built contract, so a contract/call mismatch is
+/// unrepresentable through the public API. The contract field itself is
+/// private and [`ExecutionContract`] fields are private, so admitted state
+/// cannot be mutated after construction either.
 #[derive(Debug, Clone)]
 pub struct ContractedCall {
     /// Invocation name.
@@ -76,12 +93,14 @@ pub struct ContractedCall {
     /// Caller arguments (requested work only — never trusted authority).
     pub args: Value,
     /// The admitted execution this call runs under.
-    pub contract: ExecutionContract,
+    contract: ExecutionContract,
 }
 
 impl ContractedCall {
-    /// Bind a call to an admitted contract.
-    pub fn new(tool: String, args: Value, contract: ExecutionContract) -> Self {
+    /// Admit a call: mint a fresh execution id and derive the replay
+    /// fingerprint from exactly this tool, these arguments and this scope.
+    pub fn new(tool: String, args: Value, scope: ExecutionScope, policy_identity: &str) -> Self {
+        let contract = ExecutionContract::admit(scope, &tool, &args, policy_identity.to_string());
         ContractedCall {
             tool,
             args,
@@ -93,8 +112,31 @@ impl ContractedCall {
     /// admission: a fresh id, Workspace scope, and this registry's policy
     /// identity. The Workspace scope is stated, not defaulted.
     pub fn local(registry: &ToolRegistry, tool: &str, args: Value) -> Self {
-        let contract = ExecutionContract::local(tool, &args, registry.policy_identity());
-        ContractedCall::new(tool.to_string(), args, contract)
+        Self::new(
+            tool.to_string(),
+            args,
+            ExecutionScope::Workspace,
+            registry.policy_identity(),
+        )
+    }
+
+    /// The admitted execution this call runs under.
+    pub fn contract(&self) -> &ExecutionContract {
+        &self.contract
+    }
+
+    /// Substitute caller arguments after admission (sequence template
+    /// expansion). The admitted contract — id, scope, fingerprint over the
+    /// admitted step, policy — is preserved as-is. Crate-private: only the
+    /// registry's sequence path expands templates, and replay identity is
+    /// never consulted there, so no public caller can skew a cached
+    /// fingerprint away from executed work.
+    pub(crate) fn with_args(self, args: Value) -> Self {
+        ContractedCall {
+            tool: self.tool,
+            args,
+            contract: self.contract,
+        }
     }
 }
 
@@ -253,7 +295,7 @@ impl ToolRegistry {
         let mut conflict = false;
         let mut done_count = 0usize;
         map.retain(|e, s| match s {
-            ReplayState::Done { entry } => {
+            ReplayState::Done { entry, .. } => {
                 if now.duration_since(entry.inserted) >= self.cache_ttl {
                     return false;
                 }
@@ -285,7 +327,7 @@ impl ToolRegistry {
         let mut done: Vec<(ReplayId, Instant)> = map
             .iter()
             .filter_map(|(id, s)| match s {
-                ReplayState::Done { entry } => Some((id.clone(), entry.inserted)),
+                ReplayState::Done { entry, .. } => Some((id.clone(), entry.inserted)),
                 ReplayState::InFlight { .. } => None,
             })
             .collect();
@@ -360,22 +402,24 @@ impl ToolRegistry {
     /// caller arguments never carry authority. This is the only path the
     /// coordinator uses — [`ToolRegistry::execute`] stays as the explicit
     /// trusted-local entry point for direct library callers.
-    pub async fn execute_with(
-        &self,
-        ctx: &ExecutionContract,
-        name: &str,
-        args: Value,
-    ) -> Result<ToolOutcome> {
+    pub async fn execute_with(&self, call: ContractedCall) -> Result<ToolOutcome> {
+        // Destructure once: the contract, tool name and arguments below all
+        // come from the same admitted call — no independent representations.
+        let ContractedCall {
+            tool: name,
+            args,
+            contract,
+        } = call;
         let tool = self
             .tools
-            .get(name)
+            .get(&name)
             .ok_or_else(|| anyhow::anyhow!("tool_not_found: {name}"))?;
 
         // Validate here as well as inside the tool: a tool may be called
         // directly, and policy must hold on both paths.
-        tool.validate_with(ctx, &args).await?;
+        tool.validate_with(&contract, &args).await?;
 
-        let outcome = tool.execute_with(ctx, args).await;
+        let outcome = tool.execute_with(&contract, args).await;
         match &outcome {
             Ok(o) => tracing::info!(
                 tool = %name, success = o.success, duration_ms = o.duration_ms, "tool executed"
@@ -385,9 +429,15 @@ impl ToolRegistry {
         outcome
     }
 
-    /// Run a tool once per (`key`, request fingerprint), returning the prior
-    /// outcome on identical retries and a stable conflict — without running
-    /// anything — when the same key names a different execution.
+    /// Run a contracted call once per (`key`, request fingerprint),
+    /// returning the prior outcome on identical retries and a stable
+    /// conflict — without running anything — when the same key names a
+    /// different execution.
+    ///
+    /// The replay identity comes from the call's own contract, so the cached
+    /// fingerprint always describes the work actually executed. The first
+    /// actual side effect owns one execution id; every replay references
+    /// that origin id rather than minting a fresh one.
     ///
     /// For retrying a step whose tool has a side effect. The cache is
     /// in-memory and per-process: it does not survive a restart, so it
@@ -402,16 +452,13 @@ impl ToolRegistry {
     /// Only successful calls are cached. A failure (or tool error) removes
     /// the in-flight marker and wakes waiters, which retry as new executors —
     /// the pre-existing failure-retry semantics, unchanged.
-    pub async fn execute_once(
-        &self,
-        key: &str,
-        ctx: &ExecutionContract,
-        name: &str,
-        args: Value,
-    ) -> Result<IdempotentOutcome> {
+    pub async fn execute_once(&self, key: &str, call: ContractedCall) -> Result<IdempotentOutcome> {
+        // The replay identity comes from the call's own contract — derived
+        // at construction from exactly the tool, arguments and scope being
+        // executed. There is no independent fingerprint parameter to skew.
         let id = ReplayId {
             key: key.to_string(),
-            fingerprint: ctx.request_fingerprint.clone(),
+            fingerprint: call.contract().request_fingerprint().to_string(),
         };
         // Resolve to executor or follower. Executors break out holding the
         // new slot's notify; followers subscribe, re-check, and await.
@@ -425,10 +472,11 @@ impl ToolRegistry {
                     return Err(idempotency_conflict(key));
                 }
                 match map.get(&id) {
-                    Some(ReplayState::Done { entry }) => {
+                    Some(ReplayState::Done { entry, origin }) => {
                         return Ok(IdempotentOutcome {
                             outcome: entry.outcome.clone(),
                             replayed: true,
+                            execution_id: origin.clone(),
                         });
                     }
                     Some(ReplayState::InFlight { notify }) => Some(notify.clone()),
@@ -455,14 +503,17 @@ impl ToolRegistry {
             let done = {
                 let map = self.completed.lock().unwrap();
                 match map.get(&id) {
-                    Some(ReplayState::Done { entry }) => Some(entry.outcome.clone()),
+                    Some(ReplayState::Done { entry, origin }) => {
+                        Some((entry.outcome.clone(), origin.clone()))
+                    }
                     _ => None,
                 }
             };
-            if let Some(outcome) = done {
+            if let Some((outcome, origin)) = done {
                 return Ok(IdempotentOutcome {
                     outcome,
                     replayed: true,
+                    execution_id: origin,
                 });
             }
             notified.await;
@@ -471,8 +522,11 @@ impl ToolRegistry {
         };
 
         // Executor: the map mutex is not held from here until completion.
+        // The origin id is the call's own admitted id — the one identity
+        // this side effect will ever own.
+        let origin = call.contract().execution_id().to_string();
         let mut guard = InflightGuard::new(&self.completed, id.clone(), executor_notify.clone());
-        let outcome = self.execute_with(ctx, name, args).await;
+        let outcome = self.execute_with(call).await;
         match outcome {
             Ok(o) if o.success => {
                 {
@@ -490,6 +544,7 @@ impl ToolRegistry {
                                 outcome: o.clone(),
                                 inserted: Instant::now(),
                             },
+                            origin: origin.clone(),
                         },
                     );
                 }
@@ -498,6 +553,7 @@ impl ToolRegistry {
                 Ok(IdempotentOutcome {
                     outcome: o,
                     replayed: false,
+                    execution_id: origin,
                 })
             }
             other => {
@@ -509,6 +565,7 @@ impl ToolRegistry {
                     Ok(o) => Ok(IdempotentOutcome {
                         outcome: o,
                         replayed: false,
+                        execution_id: origin,
                     }),
                     Err(e) => Err(e),
                 }
@@ -556,11 +613,17 @@ impl ToolRegistry {
         for (index, call) in requests.into_iter().enumerate() {
             let local = local.clone();
             let workload = workload.clone();
+            // Destructure once: the spawned task owns one admitted call —
+            // tool, arguments and contract cannot drift apart.
+            let ContractedCall {
+                tool: name,
+                args,
+                contract,
+            } = call;
             // Clone registry internals via Arc self? We need `self` to be Sync.
             // Since `&self` is shared, we spawn a task that holds a cloned reference
             // to the needed tool Arc.
-            let tool = self.tools.get(&call.tool).cloned();
-            let name = call.tool.clone();
+            let tool = self.tools.get(&name).cloned();
             let handle = set.spawn(async move {
                 // Local slot first, then global workload permit: a single global
                 // order, so waiters can never deadlock against each other.
@@ -568,8 +631,8 @@ impl ToolRegistry {
                 let _slot = local.acquire_owned().await.unwrap();
                 let _work = workload.acquire_owned().await.unwrap();
                 let outcome = if let Some(tool) = tool {
-                    match tool.validate_with(&call.contract, &call.args).await {
-                        Ok(()) => tool.execute_with(&call.contract, call.args).await,
+                    match tool.validate_with(&contract, &args).await {
+                        Ok(()) => tool.execute_with(&contract, args).await,
                         Err(e) => Err(e),
                     }
                 } else {
@@ -647,7 +710,7 @@ impl ToolRegistry {
         for call in requests {
             let templated = apply_templates(&call.args, &prev_outcomes);
             let name = call.tool.clone();
-            let res = self.execute_with(&call.contract, &name, templated).await;
+            let res = self.execute_with(call.with_args(templated)).await;
             let placeholder = match &res {
                 Ok(o) => o.clone(),
                 Err(e) => ToolOutcome::failure(
@@ -800,10 +863,6 @@ mod tests {
         ContractedCall::local(reg, tool, args)
     }
 
-    fn ctx(reg: &ToolRegistry, tool: &str, args: &Value) -> ExecutionContract {
-        ExecutionContract::local(tool, args, reg.policy_identity())
-    }
-
     /// A tool that sleeps `args["ms"]` while recording peak concurrency.
     struct Sleeper {
         current: Arc<AtomicUsize>,
@@ -954,19 +1013,22 @@ mod tests {
     #[tokio::test]
     async fn execute_once_runs_a_tool_only_once() {
         let (registry, tool) = registry(true);
+        let mut origin = String::new();
         for _ in 0..5 {
             let outcome = registry
-                .execute_once(
-                    "k1",
-                    &ctx(&registry, "counter", &json!({})),
-                    "counter",
-                    json!({}),
-                )
+                .execute_once("k1", call(&registry, "counter", json!({})))
                 .await
                 .unwrap();
-            assert!(!outcome.replayed || tool.calls.load(Ordering::SeqCst) == 1);
+            if outcome.replayed {
+                // Every replay references the originating execution id.
+                assert_eq!(outcome.execution_id, origin);
+            } else {
+                origin = outcome.execution_id.clone();
+            }
+            assert!(tool.calls.load(Ordering::SeqCst) == 1);
         }
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert!(!origin.is_empty());
     }
 
     #[tokio::test]
@@ -974,12 +1036,7 @@ mod tests {
         let (registry, tool) = registry(true);
         for key in ["a", "b"] {
             let outcome = registry
-                .execute_once(
-                    key,
-                    &ctx(&registry, "counter", &json!({})),
-                    "counter",
-                    json!({}),
-                )
+                .execute_once(key, call(&registry, "counter", json!({})))
                 .await
                 .unwrap();
             assert!(!outcome.replayed);
@@ -993,12 +1050,7 @@ mod tests {
         let (registry, tool) = registry(false);
         for _ in 0..3 {
             let outcome = registry
-                .execute_once(
-                    "k",
-                    &ctx(&registry, "counter", &json!({})),
-                    "counter",
-                    json!({}),
-                )
+                .execute_once("k", call(&registry, "counter", json!({})))
                 .await
                 .unwrap();
             assert!(!outcome.replayed);
@@ -1011,21 +1063,11 @@ mod tests {
     async fn same_key_different_fingerprint_conflicts_without_executing() {
         let (registry, tool) = registry(true);
         registry
-            .execute_once(
-                "k",
-                &ctx(&registry, "counter", &json!({"v": 1})),
-                "counter",
-                json!({"v": 1}),
-            )
+            .execute_once("k", call(&registry, "counter", json!({"v": 1})))
             .await
             .unwrap();
         let err = registry
-            .execute_once(
-                "k",
-                &ctx(&registry, "counter", &json!({"v": 2})),
-                "counter",
-                json!({"v": 2}),
-            )
+            .execute_once("k", call(&registry, "counter", json!({"v": 2})))
             .await
             .unwrap_err();
         assert!(is_idempotency_conflict(&err), "{err}");
@@ -1067,15 +1109,15 @@ mod tests {
 
         let r1 = registry.clone();
         let executor = tokio::spawn(async move {
-            let c = ExecutionContract::local("slow", &json!({}), r1.policy_identity());
-            r1.execute_once("k", &c, "slow", json!({})).await
+            r1.execute_once("k", ContractedCall::local(&r1, "slow", json!({})))
+                .await
         });
         // Let the executor pass admission and block inside the tool.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let r2 = registry.clone();
         let waiter = tokio::spawn(async move {
-            let c = ExecutionContract::local("slow", &json!({}), r2.policy_identity());
-            r2.execute_once("k", &c, "slow", json!({})).await
+            r2.execute_once("k", ContractedCall::local(&r2, "slow", json!({})))
+                .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         executor.abort();

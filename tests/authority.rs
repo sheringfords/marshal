@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use marshall::server::{self, ServerConfig};
-use marshall::{ExecutionContract, ExecutionPolicy, Tool, ToolOutcome, ToolRegistry};
+use marshall::{ContractedCall, ExecutionPolicy, Tool, ToolOutcome, ToolRegistry};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -78,6 +78,19 @@ shell:
     fn app(&self) -> Router {
         server::build_router_with_cors(
             server::build_state(self.registry(), &ServerConfig::new(&self.root)),
+            None,
+        )
+    }
+
+    fn app_with_audit(&self, audit_path: PathBuf) -> Router {
+        server::build_router_with_cors(
+            server::build_state(
+                self.registry(),
+                &ServerConfig {
+                    audit_path: Some(audit_path),
+                    ..ServerConfig::new(&self.root)
+                },
+            ),
             None,
         )
     }
@@ -207,11 +220,9 @@ async fn same_key_with_a_different_tool_is_a_conflict_not_a_replay() {
     let mut reg = ToolRegistry::new();
     reg.register(alpha);
     reg.register(beta);
-    let ctx_for =
-        |tool: &str, args: &Value| ExecutionContract::local(tool, args, reg.policy_identity());
 
     let first = reg
-        .execute_once("k", &ctx_for("alpha", &json!({})), "alpha", json!({}))
+        .execute_once("k", ContractedCall::local(&reg, "alpha", json!({})))
         .await
         .expect("first call runs");
     assert_eq!(first.outcome.tool, "alpha");
@@ -219,7 +230,7 @@ async fn same_key_with_a_different_tool_is_a_conflict_not_a_replay() {
     // The same key naming a different tool must not replay alpha's outcome
     // as if beta had run, and must not run beta either.
     let second = reg
-        .execute_once("k", &ctx_for("beta", &json!({})), "beta", json!({}))
+        .execute_once("k", ContractedCall::local(&reg, "beta", json!({})))
         .await;
     assert!(second.is_err(), "cross-tool replay returned: {second:?}");
     assert!(
@@ -240,13 +251,12 @@ async fn same_key_with_different_arguments_is_a_conflict_not_a_replay() {
     let (tool, calls) = Recorder::new("rec", 0);
     let mut reg = ToolRegistry::new();
     reg.register(tool);
-    let ctx_for = |args: &Value| ExecutionContract::local("rec", args, reg.policy_identity());
 
-    reg.execute_once("k", &ctx_for(&json!({"v": 1})), "rec", json!({"v": 1}))
+    reg.execute_once("k", ContractedCall::local(&reg, "rec", json!({"v": 1})))
         .await
         .expect("first call runs");
     let second = reg
-        .execute_once("k", &ctx_for(&json!({"v": 2})), "rec", json!({"v": 2}))
+        .execute_once("k", ContractedCall::local(&reg, "rec", json!({"v": 2})))
         .await;
     assert!(
         second.is_err(),
@@ -267,20 +277,52 @@ async fn same_key_with_identical_arguments_replays_without_reexecuting() {
     let (tool, calls) = Recorder::new("rec", 0);
     let mut reg = ToolRegistry::new();
     reg.register(tool);
-    let ctx_for = |args: &Value| ExecutionContract::local("rec", args, reg.policy_identity());
 
     let first = reg
-        .execute_once("k", &ctx_for(&json!({"v": 1})), "rec", json!({"v": 1}))
+        .execute_once("k", ContractedCall::local(&reg, "rec", json!({"v": 1})))
         .await
         .unwrap();
     assert!(!first.replayed);
     let second = reg
-        .execute_once("k", &ctx_for(&json!({"v": 1})), "rec", json!({"v": 1}))
+        .execute_once("k", ContractedCall::local(&reg, "rec", json!({"v": 1})))
         .await
         .unwrap();
     assert!(second.replayed);
+    // The replay references the originating execution id — it does not mint
+    // a fresh one for work that already ran.
+    assert_eq!(first.execution_id, second.execution_id);
     assert_eq!(first.outcome.summary, second.outcome.summary);
     assert_eq!(calls.lock().await.len(), 1, "identical retry re-executed");
+}
+
+#[tokio::test]
+async fn contracted_calls_bind_fingerprint_to_their_own_work() {
+    // The only public constructors derive the fingerprint from exactly the
+    // tool, arguments and scope they carry: calls that differ in any of the
+    // three fingerprint distinctly, identical calls fingerprint identically.
+    // There is no constructor that accepts an independent fingerprint, so a
+    // contract/call mismatch cannot be built through the public API.
+    let reg = ToolRegistry::new();
+    let fp = |call: &ContractedCall| call.contract().request_fingerprint().to_string();
+    let base = ContractedCall::local(&reg, "rec", json!({"v": 1}));
+    let same = ContractedCall::local(&reg, "rec", json!({"v": 1}));
+    let other_tool = ContractedCall::local(&reg, "other", json!({"v": 1}));
+    let other_args = ContractedCall::local(&reg, "rec", json!({"v": 2}));
+    let other_scope = ContractedCall::new(
+        "rec".to_string(),
+        json!({"v": 1}),
+        marshall::ExecutionScope::Session(PathBuf::from("/tmp/s1")),
+        reg.policy_identity(),
+    );
+    assert_eq!(fp(&base), fp(&same));
+    assert_ne!(fp(&base), fp(&other_tool));
+    assert_ne!(fp(&base), fp(&other_args));
+    assert_ne!(fp(&base), fp(&other_scope));
+    // Scope is readable but not mutable through the public API.
+    assert_eq!(
+        base.contract().scope(),
+        &marshall::ExecutionScope::Workspace
+    );
 }
 
 #[tokio::test]
@@ -296,16 +338,18 @@ async fn concurrent_identical_calls_execute_exactly_once() {
     for _ in 0..16 {
         let r = reg.clone();
         handles.push(tokio::spawn(async move {
-            let ctx = ExecutionContract::local("rec", &json!({"v": 1}), r.policy_identity());
-            r.execute_once("k", &ctx, "rec", json!({"v": 1})).await
+            r.execute_once("k", ContractedCall::local(&r, "rec", json!({"v": 1})))
+                .await
         }));
     }
-    let mut ok = 0;
+    let mut ids = std::collections::HashSet::new();
     for h in handles {
-        assert!(h.await.unwrap().is_ok());
-        ok += 1;
+        let settled = h.await.unwrap().expect("identical retry must succeed");
+        ids.insert(settled.execution_id);
     }
-    assert_eq!(ok, 16);
+    // One actual side effect, and every caller — executor or waiter —
+    // resolves to the single originating execution id.
+    assert_eq!(ids.len(), 1, "callers resolved to distinct executions");
     assert_eq!(
         calls.lock().await.len(),
         1,
@@ -327,8 +371,8 @@ async fn concurrent_conflicting_calls_produce_one_side_effect() {
         let r = reg.clone();
         handles.push(tokio::spawn(async move {
             let args = json!({"i": i});
-            let ctx = ExecutionContract::local("rec", &args, r.policy_identity());
-            r.execute_once("k", &ctx, "rec", args).await
+            r.execute_once("k", ContractedCall::local(&r, "rec", args))
+                .await
         }));
     }
     let mut ok = 0;
@@ -527,6 +571,100 @@ async fn stream_replay_shares_execute_identity_semantics() {
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(text.contains("event: done"), "{text}");
     assert!(!text.contains("event: error"), "{text}");
+}
+
+// ── replay origin identity in audit ─────────────────────────
+
+fn audit_lines(path: &PathBuf) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .map(|l| serde_json::from_str(l).expect("audit line"))
+        .collect()
+}
+
+#[tokio::test]
+async fn executed_audit_id_equals_replay_audit_origin_id() {
+    // Finding 1 closure: the first actual side effect owns one execution
+    // id, and the replay references that origin id instead of minting a
+    // fresh one — while still reporting `replayed`, not `executed`.
+    let ws = Workspace::new("audit_origin");
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with_audit(audit_path.clone());
+    let target = ws.path("origin.txt");
+    let write = || {
+        execute_once(
+            "filesystem",
+            json!({"operation": "write", "path": target, "content": "v"}),
+            "origin-key",
+        )
+    };
+
+    let (status, _) = send(&app, post("/v1/execute", write())).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, post("/v1/execute", write())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lines = audit_lines(&audit_path);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["execution_status"], "executed");
+    assert_eq!(lines[1]["execution_status"], "replayed");
+    assert!(!lines[0]["execution_id"].as_str().unwrap().is_empty());
+    assert_eq!(
+        lines[0]["execution_id"], lines[1]["execution_id"],
+        "replay minted a fresh execution id instead of referencing the origin"
+    );
+    assert_eq!(
+        lines[0]["request_fingerprint"],
+        lines[1]["request_fingerprint"]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_identical_http_retries_share_one_origin_id() {
+    // N simultaneous identical callers: one actual execution, and every
+    // audit line — the single `executed` plus all `replayed` — references
+    // the same originating execution id. Any timing still yields exactly
+    // one execution for one key/fingerprint, so this is deterministic.
+    let ws = Workspace::new("audit_concurrent");
+    let audit_path = ws.path("audit.jsonl");
+    let app = ws.app_with_audit(audit_path.clone());
+    let target = ws.path("shared.txt");
+    let body = execute_once(
+        "filesystem",
+        json!({"operation": "write", "path": target, "content": "v"}),
+        "concurrent-key",
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let app = app.clone();
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            send(&app, post("/v1/execute", body)).await
+        }));
+    }
+    for h in handles {
+        let (status, _) = h.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let lines = audit_lines(&audit_path);
+    assert_eq!(lines.len(), 16, "{lines:?}");
+    let executed = lines
+        .iter()
+        .filter(|l| l["execution_status"] == "executed")
+        .count();
+    let replayed = lines
+        .iter()
+        .filter(|l| l["execution_status"] == "replayed")
+        .count();
+    assert_eq!(executed, 1, "more than one actual execution: {lines:?}");
+    assert_eq!(replayed, 15, "{lines:?}");
+    let ids: std::collections::HashSet<&str> = lines
+        .iter()
+        .map(|l| l["execution_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1, "audit lines reference distinct ids: {ids:?}");
 }
 
 // ── JSON-carried authority ──────────────────────────────────
@@ -774,16 +912,16 @@ async fn a_swapped_registry_cannot_widen_an_admitted_scope() {
         "operation": "read",
         "path": ws.path("secret.txt"),
     });
-    let ctx = ExecutionContract::admit(
+    let narrow_call = ContractedCall::new(
+        "filesystem".to_string(),
+        args,
         marshall::ExecutionScope::Session(ws.path("sessions-only")),
-        "filesystem",
-        &args,
-        narrow.policy_identity().to_string(),
+        narrow.policy_identity(),
     );
 
     for reg in [&narrow, &wide] {
         let err = reg
-            .execute_with(&ctx, "filesystem", args.clone())
+            .execute_with(narrow_call.clone())
             .await
             .expect_err("wide registry must not widen admitted scope");
         assert!(err.to_string().contains("path_not_allowed"), "{err}");

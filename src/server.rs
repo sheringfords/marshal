@@ -858,19 +858,11 @@ async fn execution_scope(state: &AppState, session_id: Option<&String>) -> Optio
 // adapter preserves.
 // ---------------------------------------------------------------------------
 
-/// A single admitted unit of work: the tool, its caller arguments, and the
-/// immutable execution contract binding scope, replay identity and policy
-/// identity to this execution. Constructed only by `prepare_one` /
-/// `preflight_all`, never directly by handlers.
-struct AdmittedItem {
-    tool: String,
-    args: serde_json::Value,
-    contract: ExecutionContract,
-}
-
-/// Admit session + egress, then bind the execution contract. Single
+/// Admit session + egress, then admit the contracted call. Single
 /// execution and buffered streaming share this path, so a streamed call can
-/// never skip what a single call checks.
+/// never skip what a single call checks. The returned call owns its tool,
+/// arguments and contract as one representation — callers never handle the
+/// three independently.
 #[allow(clippy::result_large_err)]
 async fn prepare_one(
     state: &AppState,
@@ -878,7 +870,7 @@ async fn prepare_one(
     session_id: Option<&String>,
     tool: &str,
     args: &serde_json::Value,
-) -> Result<AdmittedItem, Response> {
+) -> Result<ContractedCall, Response> {
     if let Some(resp) = admit_item(state, session_id, tool, args).await {
         return Err(resp);
     }
@@ -886,28 +878,27 @@ async fn prepare_one(
         let sid = session_id.map(String::as_str).unwrap_or("unknown");
         return Err(session_not_found(sid));
     };
-    let contract =
-        ExecutionContract::admit(scope, tool, args, registry.policy_identity().to_string());
-    Ok(AdmittedItem {
-        tool: tool.to_string(),
-        args: args.clone(),
-        contract,
-    })
+    Ok(ContractedCall::new(
+        tool.to_string(),
+        args.clone(),
+        scope,
+        registry.policy_identity(),
+    ))
 }
 
 /// Admit every item of a batch/sequence before anything runs: the top-level
 /// session must exist (even for an empty request), then each item is admitted
 /// against its effective session (per-item override wins) plus egress, then
-/// each item is bound to its own execution contract under its effective
-/// session's scope. The first failure denies the whole request; no item
-/// executes unless all pass.
+/// each item is admitted as a contracted call under its effective session's
+/// scope. The first failure denies the whole request; no item executes
+/// unless all pass.
 #[allow(clippy::result_large_err)]
 async fn preflight_all(
     state: &AppState,
     registry: &ToolRegistry,
     top_sid: Option<&String>,
     items: &[ExecuteRequest],
-) -> Result<Vec<AdmittedItem>, Response> {
+) -> Result<Vec<ContractedCall>, Response> {
     if let Some(sid) = top_sid {
         if let Some(resp) = require_session(state, sid).await {
             return Err(resp);
@@ -926,50 +917,49 @@ async fn preflight_all(
             let sid = effective.map(String::as_str).unwrap_or("unknown");
             return Err(session_not_found(sid));
         };
-        admitted.push(AdmittedItem {
-            contract: ExecutionContract::admit(
-                scope,
-                &r.tool,
-                &r.args,
-                registry.policy_identity().to_string(),
-            ),
-            tool: r.tool.clone(),
-            args: r.args.clone(),
-        });
+        admitted.push(ContractedCall::new(
+            r.tool.clone(),
+            r.args.clone(),
+            scope,
+            registry.policy_identity(),
+        ));
     }
     Ok(admitted)
 }
 
-/// Run one admitted item through a registry snapshot, honoring idempotency
-/// keys exactly as single execution always has — now bound to the item's
-/// replay fingerprint, so a reused key for different work conflicts instead
-/// of replaying.
+/// Run one admitted call through a registry snapshot, honoring idempotency
+/// keys — now bound to the call's own replay fingerprint, so a reused key
+/// for different work conflicts instead of replaying.
 async fn run_one(
     registry: &ToolRegistry,
-    item: AdmittedItem,
+    call: ContractedCall,
     idempotency_key: Option<String>,
 ) -> Result<IdempotentOutcome, anyhow::Error> {
     if let Some(key) = idempotency_key {
-        registry
-            .execute_once(&key, &item.contract, &item.tool, item.args)
-            .await
+        registry.execute_once(&key, call).await
     } else {
+        // The admitted id is read before dispatch consumes the call: a
+        // fresh non-idempotent execution owns it at once and can never
+        // replay, so it is trivially its own origin.
+        let origin = call.contract().execution_id().to_string();
+        let outcome = registry.execute_with(call).await?;
         Ok(IdempotentOutcome {
-            outcome: registry
-                .execute_with(&item.contract, &item.tool, item.args)
-                .await?,
+            outcome,
             replayed: false,
+            execution_id: origin,
         })
     }
 }
 
 /// Which execution an audited outcome belongs to, and whether it ran now.
-/// The contract is borrowed from the admitted item; the flag comes from the
-/// idempotent run. Replay audit reuses the *original* execution id — a
+/// The contract is borrowed from the admitted call; the flag comes from the
+/// idempotent run. `execution_id` is the *originating* id — the fresh
+/// admitted id for a new execution, the stored origin id for a replay. A
 /// replay never mints a side effect, so it must never mint an id for one.
 struct ExecAttribution<'a> {
     contract: &'a ExecutionContract,
     replayed: bool,
+    execution_id: &'a str,
 }
 
 /// Record one outcome: audit + metrics + response value. The single choke
@@ -1009,7 +999,7 @@ async fn execute(
     let registry = state.registry.read().await.clone();
     // Admission binds the execution contract (scope, replay identity,
     // policy identity); caller JSON never carries authority.
-    let item = match prepare_one(
+    let call = match prepare_one(
         &state,
         &registry,
         req.session_id.as_ref(),
@@ -1018,13 +1008,13 @@ async fn execute(
     )
     .await
     {
-        Ok(item) => item,
+        Ok(call) => call,
         Err(resp) => return resp,
     };
 
     let started = Instant::now();
-    let attribution = item.contract.clone();
-    let ran = match run_one(&registry, item, req.idempotency_key).await {
+    let attribution = call.contract().clone();
+    let ran = match run_one(&registry, call, req.idempotency_key).await {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, tool = %req.tool, "execute rejected");
@@ -1047,14 +1037,15 @@ async fn execute(
     };
 
     // Audit: JSONL with sha256 (P0 redaction intact), metrics + OTel.
-    // A replay is audited under the *original* execution id with a replayed
-    // status — never as a newly executed side effect.
+    // A replay is audited under the *originating* execution id with a
+    // replayed status — never as a newly executed side effect.
     let body = record_outcome(
         &state,
         &ran.outcome,
         ExecAttribution {
             contract: &attribution,
             replayed: ran.replayed,
+            execution_id: &ran.execution_id,
         },
         started.elapsed().as_millis() as u64,
     )
@@ -1130,23 +1121,24 @@ async fn execute_batch(
         Ok(items) => items,
         Err(resp) => return resp,
     };
-    let contracts: Vec<ExecutionContract> =
-        admitted.iter().map(|item| item.contract.clone()).collect();
-    let inner: Vec<ContractedCall> = admitted
-        .into_iter()
-        .map(|item| ContractedCall::new(item.tool, item.args, item.contract))
+    let contracts: Vec<ExecutionContract> = admitted
+        .iter()
+        .map(|call| call.contract().clone())
         .collect();
     state.metrics.inc_request();
     // Workload permits come from the shared global semaphore: at most
     // `concurrency` items execute at once across all requests. Dropping this
     // future (client disconnect) aborts queued/running items via the
     // registry's abort-on-drop set; permits release through RAII.
-    let results = registry.execute_batch(inner, max, &state.semaphore).await;
+    let results = registry
+        .execute_batch(admitted, max, &state.semaphore)
+        .await;
     let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
     for (r, contract) in results.into_iter().zip(contracts) {
         match r {
             Ok(o) => {
                 // One audit record per executed item, as in `execute`.
+                // Batch items never replay: each owns its admitted id.
                 outcomes.push(
                     record_outcome(
                         &state,
@@ -1154,6 +1146,7 @@ async fn execute_batch(
                         ExecAttribution {
                             contract: &contract,
                             replayed: false,
+                            execution_id: contract.execution_id(),
                         },
                         o.duration_ms,
                     )
@@ -1211,20 +1204,19 @@ async fn execute_sequence(
     };
     let continue_on_error = req.continue_on_error.unwrap_or(false);
     let total = admitted.len();
-    let contracts: Vec<ExecutionContract> =
-        admitted.iter().map(|item| item.contract.clone()).collect();
-    let inner: Vec<ContractedCall> = admitted
-        .into_iter()
-        .map(|item| ContractedCall::new(item.tool, item.args, item.contract))
+    let contracts: Vec<ExecutionContract> = admitted
+        .iter()
+        .map(|call| call.contract().clone())
         .collect();
     state.metrics.inc_request();
-    let results = registry.execute_sequence(inner, continue_on_error).await;
+    let results = registry.execute_sequence(admitted, continue_on_error).await;
     let executed = results.len();
     let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
     for (r, contract) in results.into_iter().zip(contracts) {
         match r {
             Ok(o) => {
                 // One audit record per executed step, as in `execute`.
+                // Steps never replay: each owns its admitted id.
                 outcomes.push(
                     record_outcome(
                         &state,
@@ -1232,6 +1224,7 @@ async fn execute_sequence(
                         ExecAttribution {
                             contract: &contract,
                             replayed: false,
+                            execution_id: contract.execution_id(),
                         },
                         o.duration_ms,
                     )
@@ -1282,7 +1275,7 @@ async fn execute_stream(
     // a streamed call can never skip what a single call checks — including
     // the replay identity that keeps stream/execute retries coherent.
     let registry = state.registry.read().await.clone();
-    let item = match prepare_one(
+    let call = match prepare_one(
         &state,
         &registry,
         req.session_id.as_ref(),
@@ -1291,13 +1284,13 @@ async fn execute_stream(
     )
     .await
     {
-        Ok(item) => item,
+        Ok(call) => call,
         Err(resp) => return resp,
     };
 
     let started = Instant::now();
-    let attribution = item.contract.clone();
-    let outcome = match run_one(&registry, item, req.idempotency_key).await {
+    let attribution = call.contract().clone();
+    let outcome = match run_one(&registry, call, req.idempotency_key).await {
         Ok(ran) => {
             let _ = record_outcome(
                 &state,
@@ -1305,6 +1298,7 @@ async fn execute_stream(
                 ExecAttribution {
                     contract: &attribution,
                     replayed: ran.replayed,
+                    execution_id: &ran.execution_id,
                 },
                 started.elapsed().as_millis() as u64,
             )
@@ -1415,14 +1409,15 @@ async fn audit_log(
         "summary": outcome.summary,
         "content_sha256": outcome.content.as_ref().map(|b| crate::sha256_hex(b)),
         "redaction_policy_version": crate::REDACTION_POLICY_VERSION,
-        // One execution identity shared by dispatch and audit: the id that
-        // ran (replays reuse the original id — a replay never mints a side
-        // effect, so it never mints an id for one), the replay fingerprint
-        // and policy snapshot (both digests, safe to record), and whether
-        // this record is a new execution or a replay of one.
-        "execution_id": exec.contract.execution_id,
-        "request_fingerprint": exec.contract.request_fingerprint,
-        "policy_identity": exec.contract.policy_identity,
+        // One execution identity shared by dispatch and audit: the
+        // originating id (replays reference the stored origin — a replay
+        // never mints a side effect, so it never mints an id for one), the
+        // replay fingerprint and policy snapshot (both digests, safe to
+        // record), and whether this record is a new execution or a replay
+        // of one.
+        "execution_id": exec.execution_id,
+        "request_fingerprint": exec.contract.request_fingerprint(),
+        "policy_identity": exec.contract.policy_identity(),
         "execution_status": if exec.replayed { "replayed" } else { "executed" },
     });
     let line = serde_json::to_string(&entry).unwrap_or_default();

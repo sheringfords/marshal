@@ -46,25 +46,30 @@ impl ExecutionScope {
 
 /// One admitted execution: fresh id, trusted scope, replay identity, policy.
 ///
-/// Constructed only at admission (or via [`ExecutionContract::local`] for
-/// explicit trusted-local library use), then threaded read-only to the tool
-/// boundary and the audit record.
+/// Constructed only by [`ExecutionContract::admit`] / [`ExecutionContract::local`],
+/// which always derive the fingerprint from exactly the tool, arguments and
+/// scope they are given — so a contract can never disagree with the call it
+/// was built for. Fields are private: callers read through accessors and
+/// cannot mutate the identity after admission. The registry executes the
+/// [`ContractedCall`](crate::ContractedCall) unit (tool + args + contract)
+/// rather than accepting the three independently, which is what makes a
+/// contract/call mismatch unrepresentable at the execution boundary.
 #[derive(Debug, Clone)]
 pub struct ExecutionContract {
     /// Fresh server-generated opaque identity for one admitted execution.
     /// Shared by dispatch, replay matching and audit — never duplicated into
     /// parallel request/audit/replay id systems.
-    pub execution_id: String,
+    execution_id: String,
     /// Typed trusted authority for this execution.
-    pub scope: ExecutionScope,
+    scope: ExecutionScope,
     /// Canonical digest over operation identity, canonical arguments and
     /// trusted scope. Deterministic for identical work, distinct for any
     /// change of tool, arguments or scope. A one-way hash: safe to record.
-    pub request_fingerprint: String,
+    request_fingerprint: String,
     /// Identity of the policy snapshot that admitted the work (content hash
     /// of the effective policy, or the ad-hoc marker for hand-built
     /// registries). Recorded in audit, never trusted from the caller.
-    pub policy_identity: String,
+    policy_identity: String,
 }
 
 impl ExecutionContract {
@@ -99,7 +104,10 @@ impl ExecutionContract {
     /// Canonical digest binding operation identity to tool, canonical
     /// arguments and trusted scope. Canonical JSON sorts every object key
     /// recursively, so JSON object insertion order cannot change the digest.
-    pub fn fingerprint(tool: &str, scope: &ExecutionScope, args: &serde_json::Value) -> String {
+    /// Internal: only [`ExecutionContract::admit`] mints fingerprints, which
+    /// keeps every fingerprint consistent with its contract's tool, arguments
+    /// and scope by construction.
+    fn fingerprint(tool: &str, scope: &ExecutionScope, args: &serde_json::Value) -> String {
         let input = serde_json::json!({
             "v": 1,
             "tool": tool,
@@ -115,6 +123,26 @@ impl ExecutionContract {
             ExecutionScope::Session(root) => Some(root),
             ExecutionScope::Workspace => None,
         }
+    }
+
+    /// The admitted execution's opaque identity.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// The admitted trusted scope.
+    pub fn scope(&self) -> &ExecutionScope {
+        &self.scope
+    }
+
+    /// The replay fingerprint bound at admission.
+    pub fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    /// The admitting policy snapshot's identity.
+    pub fn policy_identity(&self) -> &str {
+        &self.policy_identity
     }
 }
 
@@ -219,8 +247,8 @@ mod tests {
             ExecutionContract::admit(ExecutionScope::Workspace, "t", &json!({}), "p".to_string());
         let b =
             ExecutionContract::admit(ExecutionScope::Workspace, "t", &json!({}), "p".to_string());
-        assert_ne!(a.execution_id, b.execution_id);
+        assert_ne!(a.execution_id(), b.execution_id());
         // ...while the replay identity matches, so retries join.
-        assert_eq!(a.request_fingerprint, b.request_fingerprint);
+        assert_eq!(a.request_fingerprint(), b.request_fingerprint());
     }
 }
