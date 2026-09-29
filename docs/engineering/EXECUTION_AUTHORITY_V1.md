@@ -69,9 +69,17 @@ three independently — `ContractedCall::new` admits the contract internally
 from exactly the tool, arguments and scope the call carries, and the
 contract field itself is private. There is no public constructor that takes
 an independently built contract, and the only argument-substitution path
-(`with_args`, sequence template expansion) is `pub(crate)`. A
+(`with_args`, sequence template expansion) is `pub(crate)`. The call's
+`tool` and `args` fields are likewise private: after construction,
+external callers cannot change any value covered by the request
+fingerprint. Read-only `tool()`, `args()` and `contract()` accessors
+cover legitimate inspection; ownership (destructuring) happens only
+inside the registry module, and no public setter or mutable reference to
+tool, args, contract, fingerprint, scope or policy identity exists. A
 contract/call mismatch is therefore unrepresentable through the public
-API — not validated-away, but inexpressible.
+API — not validated-away, but inexpressible. Trusted library callers
+keep the explicit `ContractedCall::local` / `ExecutionContract::local`
+Workspace APIs.
 
 Execution identity vs request occurrence: every admission mints a fresh
 `execution_id` (a carrier for that attempt), but the *execution* identity

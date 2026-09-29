@@ -83,15 +83,18 @@ pub struct IdempotentOutcome {
 /// The contract is admitted inside [`ContractedCall::new`] from exactly the
 /// tool, arguments and scope the call carries — there is no constructor that
 /// accepts an independently built contract, so a contract/call mismatch is
-/// unrepresentable through the public API. The contract field itself is
-/// private and [`ExecutionContract`] fields are private, so admitted state
-/// cannot be mutated after construction either.
+/// unrepresentable through the public API. All three fields are private
+/// with read-only accessors: after construction through a public safe API,
+/// no external caller can change any value covered by the request
+/// fingerprint. The contract field itself is private and
+/// [`ExecutionContract`] fields are private, so admitted state cannot be
+/// mutated after construction either.
 #[derive(Debug, Clone)]
 pub struct ContractedCall {
     /// Invocation name.
-    pub tool: String,
+    tool: String,
     /// Caller arguments (requested work only — never trusted authority).
-    pub args: Value,
+    args: Value,
     /// The admitted execution this call runs under.
     contract: ExecutionContract,
 }
@@ -123,6 +126,16 @@ impl ContractedCall {
     /// The admitted execution this call runs under.
     pub fn contract(&self) -> &ExecutionContract {
         &self.contract
+    }
+
+    /// The invocation name this call was admitted with.
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// The caller arguments this call was admitted with.
+    pub fn args(&self) -> &Value {
+        &self.args
     }
 
     /// Substitute caller arguments after admission (sequence template

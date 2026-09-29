@@ -323,6 +323,10 @@ async fn contracted_calls_bind_fingerprint_to_their_own_work() {
         base.contract().scope(),
         &marshall::ExecutionScope::Workspace
     );
+    // Read-only accessors reflect exactly the construction inputs.
+    assert_eq!(base.tool(), "rec");
+    assert_eq!(base.args(), &json!({"v": 1}));
+    assert_eq!(other_tool.tool(), "other");
 }
 
 #[tokio::test]
