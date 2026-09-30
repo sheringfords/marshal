@@ -335,7 +335,6 @@ impl ShellTool {
                 )
             }
         };
-
         // stdin handling — capped to stdin_limit, supports utf8 or base64
         if args.get("stdin").is_some() && args.get("stdin_base64").is_some() {
             bail!("provide only one of stdin or stdin_base64");
@@ -364,6 +363,26 @@ impl ShellTool {
         };
 
         Ok((allowed.program.clone(), arguments, working_dir, stdin))
+    }
+
+    /// Parse under a typed session scope: everything `parse` checks, plus
+    /// the resolved `working_dir` — evaluated *after* any sequence template
+    /// expansion, at the actual execution boundary — must stay inside the
+    /// session root. Both values are canonical, so the check is
+    /// component-wise. `None` scope is the explicit trusted-local path.
+    #[allow(clippy::type_complexity)]
+    fn parse_with(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        args: &Value,
+    ) -> Result<(PathBuf, Vec<String>, Option<PathBuf>, Option<Vec<u8>>)> {
+        let (program, arguments, working_dir, stdin) = self.parse(args)?;
+        if let (Some(root), Some(dir)) = (scope, working_dir.as_ref()) {
+            if !dir.starts_with(root) {
+                anyhow::bail!("path_not_allowed");
+            }
+        }
+        Ok((program, arguments, working_dir, stdin))
     }
 }
 
@@ -415,9 +434,34 @@ impl Tool for ShellTool {
         self.parse(args).map(|_| ())
     }
 
+    async fn validate_with(&self, ctx: &crate::ExecutionContract, args: &Value) -> Result<()> {
+        self.parse_with(ctx.session_root(), args).map(|_| ())
+    }
+
     async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+        self.execute_inner(None, args).await
+    }
+
+    async fn execute_with(
+        &self,
+        ctx: &crate::ExecutionContract,
+        args: Value,
+    ) -> Result<ToolOutcome> {
+        self.execute_inner(ctx.session_root(), args).await
+    }
+}
+
+impl ShellTool {
+    /// Shared execution body: `None` scope is the explicit trusted-local
+    /// path (tool sandbox bounds only); a session scope additionally
+    /// confines the resolved `working_dir` at execution time.
+    async fn execute_inner(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        args: Value,
+    ) -> Result<ToolOutcome> {
         let started = Instant::now();
-        let (program, arguments, working_dir, stdin) = self.parse(&args)?;
+        let (program, arguments, working_dir, stdin) = self.parse_with(scope, &args)?;
 
         debug!(
             program = %program.display(),
@@ -685,6 +729,39 @@ mod tests {
             .validate(&json!({"program": echo_path(), "working_dir": base.join("safe_evil").to_string_lossy()}))
             .await
             .is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_contract_session_root_confines_the_resolved_working_dir() {
+        // The tool sandbox admits the whole base, but the contract narrows
+        // to the session subdirectory — including values that only resolve
+        // after template expansion, since the check runs on the resolved
+        // directory at the execution boundary.
+        let base = std::env::temp_dir().join(format!("exectool_wd_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("session")).unwrap();
+        let session_root = base.join("session").canonicalize().unwrap();
+
+        let tool =
+            tool_allowing(ArgumentPolicy::None).with_working_dirs(Sandbox::new([&base]).unwrap());
+        let ctx = crate::ExecutionContract::admit(
+            crate::ExecutionScope::Session(session_root.clone()),
+            "shell",
+            &json!({}),
+            crate::ADHOC_POLICY_IDENTITY.to_string(),
+        );
+        let run = |dir: &std::path::Path| json!({"program": echo_path(), "working_dir": dir.to_string_lossy()});
+        // Inside the session: allowed.
+        assert!(tool.validate_with(&ctx, &run(&session_root)).await.is_ok());
+        // Inside the tool sandbox but outside the session: denied with the
+        // same stable code admission uses.
+        let err = tool.validate_with(&ctx, &run(&base)).await.unwrap_err();
+        assert_eq!(err.to_string(), "path_not_allowed");
+        // And the denial holds at execution time, not just validation.
+        let err = tool.execute_with(&ctx, run(&base)).await.unwrap_err();
+        assert_eq!(err.to_string(), "path_not_allowed");
 
         let _ = std::fs::remove_dir_all(&base);
     }

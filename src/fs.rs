@@ -82,27 +82,6 @@ pub struct FileSystemTool {
     writable: bool,
 }
 
-/// Session scope state carried in tool args under the reserved key.
-///
-/// The server strips caller-supplied values before admission and injects
-/// the canonical root from its own session table, so a well-formed value
-/// is authoritative for server-mediated execution. Direct library callers
-/// (experiment harness, bins, tests) normally omit the key and get plain
-/// workspace-sandbox behavior — the documented trusted-local contract.
-/// A *present but malformed* value (non-string, or a non-absolute path
-/// the server could never have sent) fails closed: it signals forgery or
-/// a broken intermediary, and must never read as "no restriction".
-#[derive(Debug, PartialEq)]
-enum Scope {
-    /// No key: workspace-sandbox behavior (server session-less calls and
-    /// direct library use).
-    None,
-    /// Absolute session root: narrow containment to it.
-    Root(std::path::PathBuf),
-    /// Present but malformed: deny everything.
-    Malformed,
-}
-
 /// Substring search over a descriptor-retained traversal.
 ///
 /// `display_base` renders match paths exactly as the pathname walk did; all
@@ -437,62 +416,39 @@ impl FileSystemTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'path'"))
     }
 
-    /// Trusted session root bound by the server after admission, if any.
-    ///
-    /// The server strips caller-supplied values before admission and injects
-    /// the canonical root from its own session table, so a present value is
-    /// authoritative. Only absolute paths qualify; anything else is treated
-    /// as no scope (fail open would be wrong here only if the server lied,
-    /// and the server never sends a relative root).
-    fn scope_root(args: &Value) -> Option<std::path::PathBuf> {
-        match Self::scope_state(args) {
-            Scope::Root(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    fn scope_state(args: &Value) -> Scope {
-        let Some(v) = args.get(crate::server::SESSION_SCOPE_KEY) else {
-            return Scope::None;
-        };
-        match v.as_str() {
-            Some(s) if std::path::PathBuf::from(s).is_absolute() => {
-                Scope::Root(std::path::PathBuf::from(s))
-            }
-            _ => Scope::Malformed,
-        }
-    }
-
-    /// Fail closed on a malformed scope before any path is touched.
-    fn check_scope_wellformed(args: &Value) -> Result<()> {
-        if Self::scope_state(args) == Scope::Malformed {
-            anyhow::bail!("path_not_allowed");
-        }
-        Ok(())
-    }
-
     /// Resolve an existing path through the workspace sandbox and require it
     /// inside the session scope when one is bound. Returned paths are
     /// canonical, so the prefix check is component-wise.
-    fn resolve_scoped_existing(&self, args: &Value, raw: &str) -> Result<std::path::PathBuf> {
+    ///
+    /// `scope` is the contract's session root (`None` = explicit
+    /// trusted-local workspace behavior). Caller JSON is never consulted.
+    fn resolve_scoped_existing(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        raw: &str,
+    ) -> Result<std::path::PathBuf> {
         let resolved = self.sandbox.resolve_existing(raw).map_err(policy_error)?;
-        self.check_scope(args, &resolved)?;
+        self.check_scope(scope, &resolved)?;
         Ok(resolved)
     }
 
     /// Resolve a creatable path through the workspace sandbox and require it
     /// inside the session scope when one is bound.
-    fn resolve_scoped_for_create(&self, args: &Value, raw: &str) -> Result<std::path::PathBuf> {
+    fn resolve_scoped_for_create(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        raw: &str,
+    ) -> Result<std::path::PathBuf> {
         let resolved = self.sandbox.resolve_for_create(raw).map_err(policy_error)?;
-        self.check_scope(args, &resolved)?;
+        self.check_scope(scope, &resolved)?;
         Ok(resolved)
     }
 
     /// Roots that contained paths must stay inside: the session root when the
     /// call runs under a session, otherwise the tool's sandbox roots.
-    fn effective_roots(&self, args: &Value) -> Vec<std::path::PathBuf> {
-        if let Some(scope) = Self::scope_root(args) {
-            vec![scope]
+    fn effective_roots(&self, scope: Option<&std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+        if let Some(root) = scope {
+            vec![root.clone()]
         } else {
             self.sandbox.roots().to_vec()
         }
@@ -502,10 +458,12 @@ impl FileSystemTool {
     /// effective roots. Sandbox resolution guarantees canonical form, so a
     /// component-wise prefix check is sound here (remaining TOCTOU between
     /// check and I/O is M2-003 territory and documented as such).
-    fn check_scope(&self, args: &Value, resolved: &std::path::Path) -> Result<()> {
-        if Self::scope_root(args).is_some()
-            && !Self::inside_roots(&self.effective_roots(args), resolved)
-        {
+    fn check_scope(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        resolved: &std::path::Path,
+    ) -> Result<()> {
+        if scope.is_some() && !Self::inside_roots(&self.effective_roots(scope), resolved) {
             anyhow::bail!("path_not_allowed");
         }
         Ok(())
@@ -521,15 +479,15 @@ impl FileSystemTool {
     /// requires it inside the session root. A probe whose nearest existing
     /// ancestor already escapes the session is denied rather than reported
     /// absent, so `exists` cannot oracle session-external layout.
-    fn scope_probe(&self, args: &Value, raw: &str) -> Result<()> {
-        let Some(scope) = Self::scope_root(args) else {
+    fn scope_probe(&self, scope: Option<&std::path::PathBuf>, raw: &str) -> Result<()> {
+        let Some(scope) = scope else {
             return Ok(());
         };
         let mut candidate = std::path::PathBuf::from(raw);
         loop {
             match candidate.canonicalize() {
                 Ok(canonical) => {
-                    if !canonical.starts_with(&scope) {
+                    if !canonical.starts_with(scope) {
                         anyhow::bail!("path_not_allowed");
                     }
                     return Ok(());
@@ -554,11 +512,11 @@ impl FileSystemTool {
     /// successful resolve means the root vanished mid-operation: fail closed.
     fn bind_for(
         &self,
-        args: &Value,
+        scope: Option<&std::path::PathBuf>,
         resolved: &std::path::Path,
     ) -> Result<(BoundDir, std::path::PathBuf)> {
-        let roots: Vec<std::path::PathBuf> = if let Some(scope) = Self::scope_root(args) {
-            vec![scope]
+        let roots: Vec<std::path::PathBuf> = if let Some(scope) = scope {
+            vec![scope.clone()]
         } else {
             self.sandbox.roots().to_vec()
         };
@@ -751,9 +709,33 @@ impl Tool for FileSystemTool {
     }
 
     async fn validate(&self, args: &Value) -> Result<()> {
-        // A forged or corrupted scope key denies everything up front: a
-        // malformed scope must never read as "no restriction".
-        Self::check_scope_wellformed(args)?;
+        self.validate_inner(None, args).await
+    }
+
+    async fn validate_with(&self, ctx: &crate::ExecutionContract, args: &Value) -> Result<()> {
+        self.validate_inner(ctx.session_root(), args).await
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+        // Explicit trusted-local: no contract, so the tool sandbox bounds
+        // apply and any scope-looking JSON is ignored, never enforced.
+        self.execute_inner(None, args).await
+    }
+
+    async fn execute_with(
+        &self,
+        ctx: &crate::ExecutionContract,
+        args: Value,
+    ) -> Result<ToolOutcome> {
+        self.execute_inner(ctx.session_root(), args).await
+    }
+}
+
+impl FileSystemTool {
+    /// Validate under a typed scope: `None` is the explicit trusted-local
+    /// path (tool sandbox bounds apply, caller JSON scope is never read);
+    /// `Some(root)` confines every resolved path to the session root.
+    async fn validate_inner(&self, scope: Option<&std::path::PathBuf>, args: &Value) -> Result<()> {
         let operation = Self::operation(args)?;
         let path = Self::raw_path(args)?;
 
@@ -764,7 +746,7 @@ impl Tool for FileSystemTool {
                 // A session scope narrows "outside" to outside the session root.
                 match self.sandbox.resolve_existing(path) {
                     Ok(p) => {
-                        self.check_scope(args, &p)?;
+                        self.check_scope(scope, &p)?;
                         Ok(())
                     }
                     Err(SandboxError::Unresolvable) => {
@@ -772,14 +754,14 @@ impl Tool for FileSystemTool {
                         // confines the probe: an unresolvable path whose
                         // longest existing prefix escapes the session is
                         // denied rather than reported absent.
-                        self.scope_probe(args, path)?;
+                        self.scope_probe(scope, path)?;
                         Ok(())
                     }
                     Err(e) => Err(policy_error(e)),
                 }?;
             }
             "read" | "list" | "stat" | "search" | "glob" => {
-                let _ = self.resolve_scoped_existing(args, path)?;
+                let _ = self.resolve_scoped_existing(scope, path)?;
                 if operation == "search" {
                     let pat = args
                         .get("pattern")
@@ -806,7 +788,7 @@ impl Tool for FileSystemTool {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                let _ = self.resolve_scoped_for_create(args, path)?;
+                let _ = self.resolve_scoped_for_create(scope, path)?;
                 let has_str = args.get("content").and_then(Value::as_str).is_some();
                 let has_b64 = args.get("content_base64").and_then(Value::as_str).is_some();
                 if !has_str && !has_b64 {
@@ -826,27 +808,27 @@ impl Tool for FileSystemTool {
                     anyhow::bail!("writes_not_permitted");
                 }
                 if operation == "delete" {
-                    let _ = self.resolve_scoped_existing(args, path)?;
+                    let _ = self.resolve_scoped_existing(scope, path)?;
                 } else {
-                    let _ = self.resolve_scoped_for_create(args, path)?;
+                    let _ = self.resolve_scoped_for_create(scope, path)?;
                 }
             }
             "copy" | "move" => {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                let _ = self.resolve_scoped_existing(args, path)?;
+                let _ = self.resolve_scoped_existing(scope, path)?;
                 let dest = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination' for copy/move"))?;
-                let _ = self.resolve_scoped_for_create(args, dest)?;
+                let _ = self.resolve_scoped_for_create(scope, dest)?;
             }
             "patch" => {
                 if !self.writable {
                     anyhow::bail!("writes_not_permitted");
                 }
-                let _ = self.resolve_scoped_existing(args, path)?;
+                let _ = self.resolve_scoped_existing(scope, path)?;
                 let search = args
                     .get("search")
                     .and_then(Value::as_str)
@@ -869,10 +851,18 @@ impl Tool for FileSystemTool {
         }
         Ok(())
     }
+}
 
-    async fn execute(&self, args: Value) -> Result<ToolOutcome> {
+impl FileSystemTool {
+    /// Execute under a typed scope: the contract's session root confines
+    /// every resolved path; `None` is the explicit trusted-local path.
+    async fn execute_inner(
+        &self,
+        scope: Option<&std::path::PathBuf>,
+        args: Value,
+    ) -> Result<ToolOutcome> {
         let started = Instant::now();
-        self.validate(&args).await?;
+        self.validate_inner(scope, &args).await?;
 
         let operation = Self::operation(&args)?;
         let raw = Self::raw_path(&args)?;
@@ -884,8 +874,8 @@ impl Tool for FileSystemTool {
                 // the bytes come from a verified descriptor: trailing links
                 // are followed only through open-then-verify, and a swap
                 // after authorization cannot redirect the open file.
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 let open = match leaf {
                     Some(leaf) => parent
@@ -933,8 +923,8 @@ impl Tool for FileSystemTool {
             }
 
             "write" => {
-                let resolved = self.resolve_scoped_for_create(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_for_create(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 // A trailing symlink is never traversed for a create target:
                 // an existing link fails closed (the documented
@@ -992,8 +982,8 @@ impl Tool for FileSystemTool {
             }
 
             "mkdir" => {
-                let resolved = self.resolve_scoped_for_create(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_for_create(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 // Every level is created or re-opened through retained
                 // descriptors: a swapped intermediate cannot redirect the new
                 // directory elsewhere. A trailing symlink is never traversed.
@@ -1020,8 +1010,8 @@ impl Tool for FileSystemTool {
             }
 
             "stat" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 // Open-then-stat follows trailing links exactly like
                 // `metadata` did, but the verified descriptor cannot be
@@ -1061,14 +1051,14 @@ impl Tool for FileSystemTool {
             }
 
             "copy" => {
-                let resolved_src = self.resolve_scoped_existing(&args, raw)?;
+                let resolved_src = self.resolve_scoped_existing(scope, raw)?;
                 let dest_raw = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination'"))?;
-                let resolved_dest = self.resolve_scoped_for_create(&args, dest_raw)?;
-                let (src_bound, src_rel) = self.bind_for(&args, &resolved_src)?;
-                let (dst_bound, dst_rel) = self.bind_for(&args, &resolved_dest)?;
+                let resolved_dest = self.resolve_scoped_for_create(scope, dest_raw)?;
+                let (src_bound, src_rel) = self.bind_for(scope, &resolved_src)?;
+                let (dst_bound, dst_rel) = self.bind_for(scope, &resolved_dest)?;
                 let (src_parent, src_leaf) = src_bound
                     .split_parent(&src_rel)
                     .map_err(Self::bound_policy_error)?;
@@ -1132,14 +1122,14 @@ impl Tool for FileSystemTool {
             }
 
             "move" => {
-                let resolved_src = self.resolve_scoped_existing(&args, raw)?;
+                let resolved_src = self.resolve_scoped_existing(scope, raw)?;
                 let dest_raw = args
                     .get("destination")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'destination'"))?;
-                let resolved_dest = self.resolve_scoped_for_create(&args, dest_raw)?;
-                let (src_bound, src_rel) = self.bind_for(&args, &resolved_src)?;
-                let (dst_bound, dst_rel) = self.bind_for(&args, &resolved_dest)?;
+                let resolved_dest = self.resolve_scoped_for_create(scope, dest_raw)?;
+                let (src_bound, src_rel) = self.bind_for(scope, &resolved_src)?;
+                let (dst_bound, dst_rel) = self.bind_for(scope, &resolved_dest)?;
                 let (src_parent, src_leaf) = src_bound
                     .split_parent(&src_rel)
                     .map_err(Self::bound_policy_error)?;
@@ -1190,8 +1180,8 @@ impl Tool for FileSystemTool {
             }
 
             "append" => {
-                let resolved = self.resolve_scoped_for_create(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_for_create(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 let Some(leaf) = leaf else {
                     return Err(anyhow::anyhow!("path_not_allowed"));
@@ -1238,8 +1228,8 @@ impl Tool for FileSystemTool {
             }
 
             "search" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                 let recursive = args
                     .get("recursive")
@@ -1265,8 +1255,8 @@ impl Tool for FileSystemTool {
             }
 
             "glob" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("*");
                 // Matching runs over retained descriptors; the pattern rules
                 // (length cap, no `..`, no leading `/`) are unchanged from
@@ -1286,8 +1276,8 @@ impl Tool for FileSystemTool {
             }
 
             "patch" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 // Open verified read/write: trailing links are followed only
                 // when they land inside (as before), and the same descriptor
@@ -1368,8 +1358,8 @@ impl Tool for FileSystemTool {
             }
 
             "delete" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 let (parent, leaf) = bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                 // Refuse to delete the effective root itself.
                 let Some(leaf) = leaf else {
@@ -1433,8 +1423,8 @@ impl Tool for FileSystemTool {
             }
 
             "list" => {
-                let resolved = self.resolve_scoped_existing(&args, raw)?;
-                let (bound, rel) = self.bind_for(&args, &resolved)?;
+                let resolved = self.resolve_scoped_existing(scope, raw)?;
+                let (bound, rel) = self.bind_for(scope, &resolved)?;
                 // A file target lists nothing: probe the target type through
                 // its parent first (before `bound` is consumed below) to
                 // preserve the not_a_directory outcome.
@@ -1531,8 +1521,8 @@ impl Tool for FileSystemTool {
 
             "exists" => match self.sandbox.resolve_existing(raw) {
                 Ok(p) => {
-                    self.check_scope(&args, &p)?;
-                    let (bound, rel) = self.bind_for(&args, &p)?;
+                    self.check_scope(scope, &p)?;
+                    let (bound, rel) = self.bind_for(scope, &p)?;
                     let (parent, leaf) =
                         bound.split_parent(&rel).map_err(Self::bound_policy_error)?;
                     // Existence through descriptors: the root itself exists;
@@ -1555,7 +1545,7 @@ impl Tool for FileSystemTool {
                                         match exists_link_target(
                                             &parent,
                                             leaf.as_os_str(),
-                                            &self.effective_roots(&args),
+                                            &self.effective_roots(scope),
                                         ) {
                                             LinkTarget::Inside => true,
                                             LinkTarget::Absent => false,
@@ -1580,7 +1570,7 @@ impl Tool for FileSystemTool {
                 .with_metadata("operation", "exists"))
                 }
                 Err(SandboxError::Unresolvable) => {
-                    self.scope_probe(&args, raw)?;
+                    self.scope_probe(scope, raw)?;
                     Ok(ToolOutcome::success(
                         "filesystem",
                         json!({"operation": "exists", "exists": false}),
@@ -1987,20 +1977,22 @@ mod tests {
         assert_eq!(out.summary["len"], json!(5));
     }
 
-    // ── direct-caller scope contract (M2-003 gate) ────────────
+    // ── execution-contract scope ────────────
     //
-    // The server strips and re-injects the reserved scope key, so these cases
-    // only arise for direct library callers. The contract: omitted key →
-    // workspace behavior; absolute forged key → still confined to the tool
-    // sandbox (forgery cannot widen past it, only narrow); malformed key →
-    // deny everything.
+    // Authority arrives as a typed contract, never as caller JSON. The
+    // contract: no contract → explicit trusted-local workspace behavior and
+    // any scope-looking JSON is ignored; a session contract confines every
+    // resolved path to its root, including after template expansion (the
+    // coordinator expands before dispatch, so the tool only ever sees the
+    // resolved value under the same contract).
 
-    fn scoped_args(f: &Fixture, scope: &str, op: &str, rel: &str) -> Value {
-        json!({
-            "operation": op,
-            "path": f.path(rel).to_string_lossy(),
-            crate::server::SESSION_SCOPE_KEY: scope,
-        })
+    fn contract_for(root: &std::path::Path) -> crate::ExecutionContract {
+        crate::ExecutionContract::admit(
+            crate::ExecutionScope::Session(root.to_path_buf()),
+            "filesystem",
+            &json!({}),
+            crate::ADHOC_POLICY_IDENTITY.to_string(),
+        )
     }
 
     #[tokio::test]
@@ -2016,76 +2008,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forged_absolute_scope_cannot_widen_past_the_sandbox() {
-        let f = Fixture::new("scope-forged");
-        std::fs::create_dir_all(f.path("outside")).unwrap();
-        std::fs::write(f.path("outside/secret.txt"), "secret").unwrap();
-        std::fs::write(f.path("safe/ok.txt"), "ok").unwrap();
-        // Forged "/" scope: sandbox backstop still denies outside-sandbox.
-        let err = f
-            .tool()
-            .execute(scoped_args(&f, "/", "read", "outside/secret.txt"))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("path_not_allowed"));
-        // ... while in-sandbox reads still work (scope "/" contains all).
-        let out = f
-            .tool()
-            .execute(scoped_args(&f, "/", "read", "safe/ok.txt"))
-            .await
-            .unwrap();
-        assert!(out.success);
-    }
-
-    #[tokio::test]
-    async fn forged_narrow_scope_narrows_even_for_direct_callers() {
-        let f = Fixture::new("scope-narrow");
-        std::fs::create_dir_all(f.path("safe/sub")).unwrap();
-        std::fs::write(f.path("safe/top.txt"), "top").unwrap();
-        std::fs::write(f.path("safe/sub/in.txt"), "in").unwrap();
-        // Canonicalize: the scope check compares canonical paths, and the
-        // fixture base may itself sit under a symlinked tmpdir.
-        let sub = f
-            .path("safe/sub")
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        // In-sandbox but outside the forged scope → denied.
-        let err = f
-            .tool()
-            .execute(scoped_args(&f, &sub, "read", "safe/top.txt"))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("path_not_allowed"));
-        let out = f
-            .tool()
-            .execute(scoped_args(&f, &sub, "read", "safe/sub/in.txt"))
-            .await
-            .unwrap();
-        assert!(out.success);
-    }
-
-    #[tokio::test]
-    async fn malformed_scope_denies_everything() {
-        let f = Fixture::new("scope-malformed");
+    async fn json_scope_key_is_inert_without_a_contract() {
+        // The reserved key no longer exists as a protocol: forged, narrow
+        // and malformed values are all ignored, and behavior is exactly the
+        // trusted-local workspace behavior.
+        let f = Fixture::new("scope-inert");
         std::fs::write(f.path("safe/a.txt"), "a").unwrap();
         for scope in [
+            json!("/"),
+            json!(f.path("safe").to_string_lossy()),
             json!("relative/path"),
             json!(""),
             json!(42),
             json!({"nested": "object"}),
         ] {
-            let err = f
+            let out = f
                 .tool()
                 .execute(json!({
                     "operation": "read",
                     "path": f.path("safe/a.txt").to_string_lossy(),
-                    crate::server::SESSION_SCOPE_KEY: scope,
+                    "__session_root": scope,
                 }))
                 .await
-                .unwrap_err();
-            assert!(err.to_string().contains("path_not_allowed"), "{scope}");
+                .unwrap();
+            assert!(out.success, "inert key changed behavior: {scope}");
         }
+    }
+
+    #[tokio::test]
+    async fn contract_session_root_confines_resolved_paths() {
+        let f = Fixture::new("scope-contract");
+        std::fs::create_dir_all(f.path("safe/sub")).unwrap();
+        std::fs::write(f.path("safe/top.txt"), "top").unwrap();
+        std::fs::write(f.path("safe/sub/in.txt"), "in").unwrap();
+        // Canonicalize: the scope check compares canonical paths, and the
+        // fixture base may itself sit under a symlinked tmpdir.
+        let sub = f.path("safe/sub").canonicalize().unwrap();
+        let ctx = contract_for(&sub);
+        let read = |rel: &str| json!({"operation": "read", "path": f.path(rel).to_string_lossy()});
+        // In-sandbox but outside the contract root → denied.
+        let err = f
+            .tool()
+            .execute_with(&ctx, read("safe/top.txt"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path_not_allowed"));
+        // Inside the contract root → allowed.
+        let out = f
+            .tool()
+            .execute_with(&ctx, read("safe/sub/in.txt"))
+            .await
+            .unwrap();
+        assert!(out.success);
+    }
+
+    #[tokio::test]
+    async fn contract_workspace_scope_keeps_tool_sandbox_bounds() {
+        let f = Fixture::new("scope-ws");
+        std::fs::write(f.path("safe/a.txt"), "a").unwrap();
+        let ctx =
+            crate::ExecutionContract::local("filesystem", &json!({}), crate::ADHOC_POLICY_IDENTITY);
+        let out = f
+            .tool()
+            .execute_with(
+                &ctx,
+                json!({"operation":"read","path": f.path("safe/a.txt").to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(out.success);
     }
 }

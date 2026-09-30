@@ -40,7 +40,8 @@ async fn ten_k_execute_once_bounded() {
     // 10k distinct keys, cache should evict and not grow unbounded
     for i in 0..10_000 {
         let key = format!("k{i}");
-        reg.execute_once(&key, "counter", json!({})).await.unwrap();
+        let call = marshall::ContractedCall::local(&reg, "counter", json!({}));
+        reg.execute_once(&key, call).await.unwrap();
     }
     let len = reg.cache_len().await;
     assert!(len <= 1024, "cache leaked: {len}");
@@ -53,9 +54,8 @@ async fn ten_k_execute_once_bounded() {
         let r = reg.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..100 {
-                r.execute_once(&format!("concur{i}"), "counter", json!({}))
-                    .await
-                    .unwrap();
+                let call = marshall::ContractedCall::local(&r, "counter", json!({}));
+                r.execute_once(&format!("concur{i}"), call).await.unwrap();
             }
         }));
     }

@@ -38,7 +38,8 @@ use tracing::{info, warn};
 
 use crate::ratelimit::{RateLimit, RateLimiter};
 use crate::{
-    destination as dest, EgressPolicy, ExecutionPolicy, FileSystemTool, HttpTool, Sandbox,
+    destination as dest, is_idempotency_conflict, ContractedCall, EgressPolicy, ExecutionContract,
+    ExecutionPolicy, ExecutionScope, FileSystemTool, HttpTool, IdempotentOutcome, Sandbox,
     ShellTool, ToolOutcome, ToolRegistry,
 };
 
@@ -537,16 +538,12 @@ async fn egress_allowed_hosts(state: &AppState) -> Vec<String> {
         .collect()
 }
 
-/// Reserved filesystem arg carrying the trusted effective session root.
-///
-/// Lifecycle: stripped from every incoming execution request *before*
-/// admission (a caller can never forge it), then re-injected from server-side
-/// session state *after* admission for `filesystem` items that run under a
-/// session. `FileSystemTool` requires every resolved path to stay inside this
-/// root at execution time — which also covers `{{steps}}`-templated paths
-/// that only resolve after admission, and any future registry caller that
-/// skips HTTP admission.
-pub const SESSION_SCOPE_KEY: &str = "__session_root";
+// Trusted scope never travels in caller arguments.
+//
+// There is no reserved scope key in the execution protocol: admission
+// derives the typed `ExecutionScope` from server-side session state and
+// binds it into the `ExecutionContract`, which the registry threads to the
+// tool boundary. A caller-supplied `__session_root` is ordinary inert JSON.
 
 fn path_not_allowed() -> Response {
     (
@@ -557,14 +554,6 @@ fn path_not_allowed() -> Response {
         }),
     )
         .into_response()
-}
-
-/// Remove a caller-supplied scope key, if any. The server is the sole source
-/// of session roots; anything the caller sends is untrusted.
-fn strip_scope_key(args: &mut serde_json::Value) {
-    if let Some(obj) = args.as_object_mut() {
-        obj.remove(SESSION_SCOPE_KEY);
-    }
 }
 
 /// Canonical session-path check for one (`tool`, `args`) pair.
@@ -838,35 +827,25 @@ fn effective_session<'a>(
     item_sid.or(top_sid)
 }
 
-/// Bind a filesystem item's args to its effective session root.
+/// Trusted scope for one admitted item, derived from server-side state.
 ///
-/// Looks the session up again from server-side state (fail closed when it
-/// lapsed) and writes the canonical root under [`SESSION_SCOPE_KEY`], which
-/// the tool enforces at execution time. Non-filesystem tools and
-/// session-less items are left untouched.
-async fn bind_session_scope(
-    state: &AppState,
-    session_id: Option<&String>,
-    tool: &str,
-    args: &mut serde_json::Value,
-) -> Option<Response> {
-    if tool != "filesystem" {
-        return None;
-    }
-    let sid = session_id?;
-    match session_scope_root(state, sid).await {
-        Some(root) => {
-            if let Some(obj) = args.as_object_mut() {
-                obj.insert(
-                    SESSION_SCOPE_KEY.to_string(),
-                    serde_json::Value::String(root.display().to_string()),
-                );
-            }
-            None
-        }
-        None => Some(session_not_found(sid)),
+/// A named session resolves to its canonical root (fail closed when the
+/// session lapsed between admission and binding); no session means the
+/// explicit workspace-scoped trusted-local grant. `None` is returned only
+/// when a named session is gone — the caller maps that to `session_not_found`.
+async fn execution_scope(state: &AppState, session_id: Option<&String>) -> Option<ExecutionScope> {
+    match session_id {
+        None => Some(ExecutionScope::Workspace),
+        Some(sid) => session_scope_root(state, sid)
+            .await
+            .map(ExecutionScope::Session),
     }
 }
+
+// Bind one admitted item to its execution contract: a fresh execution id,
+// the trusted scope, a replay fingerprint over tool + canonical arguments
+// + scope, and the admitting snapshot's policy identity. Immutable from
+// here to the tool boundary and the audit record.
 
 // ---------------------------------------------------------------------------
 // Execution coordinator (V2-S1)
@@ -879,52 +858,47 @@ async fn bind_session_scope(
 // adapter preserves.
 // ---------------------------------------------------------------------------
 
-/// A single admitted unit of work: the tool, its args (with the trusted
-/// session scope already bound for filesystem items), and the session it was
-/// admitted under (`None` = workspace-scoped). Constructed only by
-/// `prepare_one` / `preflight_all`, never directly by handlers.
-struct AdmittedItem {
-    tool: String,
-    args: serde_json::Value,
-}
-
-/// Strip caller scope forgery, admit session + egress, then bind the trusted
-/// scope root. Single execution and buffered streaming share this path, so a
-/// streamed call can never skip what a single call checks.
+/// Admit session + egress, then admit the contracted call. Single
+/// execution and buffered streaming share this path, so a streamed call can
+/// never skip what a single call checks. The returned call owns its tool,
+/// arguments and contract as one representation — callers never handle the
+/// three independently.
 #[allow(clippy::result_large_err)]
 async fn prepare_one(
     state: &AppState,
+    registry: &ToolRegistry,
     session_id: Option<&String>,
     tool: &str,
-    args: &mut serde_json::Value,
-) -> Result<AdmittedItem, Response> {
-    strip_scope_key(args);
+    args: &serde_json::Value,
+) -> Result<ContractedCall, Response> {
     if let Some(resp) = admit_item(state, session_id, tool, args).await {
         return Err(resp);
     }
-    if let Some(resp) = bind_session_scope(state, session_id, tool, args).await {
-        return Err(resp);
-    }
-    Ok(AdmittedItem {
-        tool: tool.to_string(),
-        args: args.clone(),
-    })
+    let Some(scope) = execution_scope(state, session_id).await else {
+        let sid = session_id.map(String::as_str).unwrap_or("unknown");
+        return Err(session_not_found(sid));
+    };
+    Ok(ContractedCall::new(
+        tool.to_string(),
+        args.clone(),
+        scope,
+        registry.policy_identity(),
+    ))
 }
 
 /// Admit every item of a batch/sequence before anything runs: the top-level
 /// session must exist (even for an empty request), then each item is admitted
 /// against its effective session (per-item override wins) plus egress, then
-/// each filesystem item is bound to its effective session root. The first
-/// failure denies the whole request; no item executes unless all pass.
+/// each item is admitted as a contracted call under its effective session's
+/// scope. The first failure denies the whole request; no item executes
+/// unless all pass.
 #[allow(clippy::result_large_err)]
 async fn preflight_all(
     state: &AppState,
+    registry: &ToolRegistry,
     top_sid: Option<&String>,
-    items: &mut [ExecuteRequest],
-) -> Result<Vec<AdmittedItem>, Response> {
-    for r in items.iter_mut() {
-        strip_scope_key(&mut r.args);
-    }
+    items: &[ExecuteRequest],
+) -> Result<Vec<ContractedCall>, Response> {
     if let Some(sid) = top_sid {
         if let Some(resp) = require_session(state, sid).await {
             return Err(resp);
@@ -937,42 +911,67 @@ async fn preflight_all(
         }
     }
     let mut admitted = Vec::with_capacity(items.len());
-    for r in items.iter_mut() {
+    for r in items.iter() {
         let effective = effective_session(top_sid, r.session_id.as_ref());
-        if let Some(resp) = bind_session_scope(state, effective, &r.tool, &mut r.args).await {
-            return Err(resp);
-        }
-        admitted.push(AdmittedItem {
-            tool: r.tool.clone(),
-            args: r.args.clone(),
-        });
+        let Some(scope) = execution_scope(state, effective).await else {
+            let sid = effective.map(String::as_str).unwrap_or("unknown");
+            return Err(session_not_found(sid));
+        };
+        admitted.push(ContractedCall::new(
+            r.tool.clone(),
+            r.args.clone(),
+            scope,
+            registry.policy_identity(),
+        ));
     }
     Ok(admitted)
 }
 
-/// Run one admitted item through a registry snapshot, honoring idempotency
-/// keys exactly as single execution always has.
+/// Run one admitted call through a registry snapshot, honoring idempotency
+/// keys — now bound to the call's own replay fingerprint, so a reused key
+/// for different work conflicts instead of replaying.
 async fn run_one(
     registry: &ToolRegistry,
-    item: AdmittedItem,
+    call: ContractedCall,
     idempotency_key: Option<String>,
-) -> Result<ToolOutcome, anyhow::Error> {
+) -> Result<IdempotentOutcome, anyhow::Error> {
     if let Some(key) = idempotency_key {
-        registry.execute_once(&key, &item.tool, item.args).await
+        registry.execute_once(&key, call).await
     } else {
-        registry.execute(&item.tool, item.args).await
+        // The admitted id is read before dispatch consumes the call: a
+        // fresh non-idempotent execution owns it at once and can never
+        // replay, so it is trivially its own origin.
+        let origin = call.contract().execution_id().to_string();
+        let outcome = registry.execute_with(call).await?;
+        Ok(IdempotentOutcome {
+            outcome,
+            replayed: false,
+            execution_id: origin,
+        })
     }
 }
 
-/// Record one executed outcome: audit + metrics + response value. The single
-/// choke point for successful-outcome recording on every endpoint; `elapsed`
-/// is the handler-measured wall time, matching previous per-endpoint values.
+/// Which execution an audited outcome belongs to, and whether it ran now.
+/// The contract is borrowed from the admitted call; the flag comes from the
+/// idempotent run. `execution_id` is the *originating* id — the fresh
+/// admitted id for a new execution, the stored origin id for a replay. A
+/// replay never mints a side effect, so it must never mint an id for one.
+struct ExecAttribution<'a> {
+    contract: &'a ExecutionContract,
+    replayed: bool,
+    execution_id: &'a str,
+}
+
+/// Record one outcome: audit + metrics + response value. The single choke
+/// point for successful-outcome recording on every endpoint; `elapsed` is
+/// the handler-measured wall time, matching previous per-endpoint values.
 async fn record_outcome(
     state: &AppState,
     outcome: &ToolOutcome,
+    exec: ExecAttribution<'_>,
     elapsed_ms: u64,
 ) -> serde_json::Value {
-    audit_log(state, outcome, elapsed_ms).await;
+    audit_log(state, outcome, exec, elapsed_ms).await;
     state
         .metrics
         .observe_with_tool(&outcome.tool, outcome.success, outcome.duration_ms);
@@ -985,7 +984,7 @@ async fn execute(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-    Json(mut req): Json<ExecuteRequest>,
+    Json(req): Json<ExecuteRequest>,
 ) -> Response {
     if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
@@ -997,21 +996,37 @@ async fn execute(
         Err(resp) => return resp,
     };
 
-    // A caller-supplied scope root is untrusted: the coordinator drops it
-    // before admission, admits session + egress, and binds the trusted root.
-    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await {
-        Ok(item) => item,
+    let registry = state.registry.read().await.clone();
+    // Admission binds the execution contract (scope, replay identity,
+    // policy identity); caller JSON never carries authority.
+    let call = match prepare_one(
+        &state,
+        &registry,
+        req.session_id.as_ref(),
+        &req.tool,
+        &req.args,
+    )
+    .await
+    {
+        Ok(call) => call,
         Err(resp) => return resp,
     };
 
     let started = Instant::now();
-    let registry = state.registry.read().await.clone();
-    let outcome = match run_one(&registry, item, req.idempotency_key).await {
+    let attribution = call.contract().clone();
+    let ran = match run_one(&registry, call, req.idempotency_key).await {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, tool = %req.tool, "execute rejected");
+            // A reused idempotency key for different work is a conflict
+            // (409), not a validation failure (400).
+            let status = if is_idempotency_conflict(&e) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             return (
-                StatusCode::BAD_REQUEST,
+                status,
                 Json(ErrorResponse {
                     error: e.to_string(),
                     code: extract_code(&e.to_string()),
@@ -1022,12 +1037,25 @@ async fn execute(
     };
 
     // Audit: JSONL with sha256 (P0 redaction intact), metrics + OTel.
-    let body = record_outcome(&state, &outcome, started.elapsed().as_millis() as u64).await;
+    // A replay is audited under the *originating* execution id with a
+    // replayed status — never as a newly executed side effect.
+    let body = record_outcome(
+        &state,
+        &ran.outcome,
+        ExecAttribution {
+            contract: &attribution,
+            replayed: ran.replayed,
+            execution_id: &ran.execution_id,
+        },
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
     info!(
-        tool = %outcome.tool,
-        success = outcome.success,
-        duration_ms = outcome.duration_ms,
-        error_code = ?outcome.error_code,
+        tool = %ran.outcome.tool,
+        success = ran.outcome.success,
+        duration_ms = ran.outcome.duration_ms,
+        error_code = ?ran.outcome.error_code,
+        replayed = ran.replayed,
         "tool executed via http"
     );
 
@@ -1084,31 +1112,46 @@ async fn execute_batch(
     }
     // Session validation per item against its effective session (per-item
     // override wins, else the top-level session), then per-item egress and
-    // scope binding — all inside the coordinator's all-items-first preflight.
-    // A top-level session must still exist even for an empty batch: an
-    // unknown session is a 404 before any item runs.
+    // contract binding — all inside the coordinator's all-items-first
+    // preflight. A top-level session must still exist even for an empty
+    // batch: an unknown session is a 404 before any item runs.
+    let registry = state.registry.read().await.clone();
     let top_sid = req.session_id.clone();
-    let admitted = match preflight_all(&state, top_sid.as_ref(), &mut req.requests).await {
+    let admitted = match preflight_all(&state, &registry, top_sid.as_ref(), &req.requests).await {
         Ok(items) => items,
         Err(resp) => return resp,
     };
-    let inner: Vec<(String, serde_json::Value)> = admitted
-        .into_iter()
-        .map(|item| (item.tool, item.args))
+    let contracts: Vec<ExecutionContract> = admitted
+        .iter()
+        .map(|call| call.contract().clone())
         .collect();
     state.metrics.inc_request();
-    let registry = state.registry.read().await.clone();
     // Workload permits come from the shared global semaphore: at most
     // `concurrency` items execute at once across all requests. Dropping this
     // future (client disconnect) aborts queued/running items via the
     // registry's abort-on-drop set; permits release through RAII.
-    let results = registry.execute_batch(inner, max, &state.semaphore).await;
+    let results = registry
+        .execute_batch(admitted, max, &state.semaphore)
+        .await;
     let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
-    for r in results {
+    for (r, contract) in results.into_iter().zip(contracts) {
         match r {
             Ok(o) => {
                 // One audit record per executed item, as in `execute`.
-                outcomes.push(record_outcome(&state, &o, o.duration_ms).await);
+                // Batch items never replay: each owns its admitted id.
+                outcomes.push(
+                    record_outcome(
+                        &state,
+                        &o,
+                        ExecAttribution {
+                            contract: &contract,
+                            replayed: false,
+                            execution_id: contract.execution_id(),
+                        },
+                        o.duration_ms,
+                    )
+                    .await,
+                );
             }
             Err(e) => {
                 state.metrics.observe_with_tool("", false, 0);
@@ -1154,26 +1197,39 @@ async fn execute_sequence(
     // session required even for an empty sequence. Egress is admitted per
     // step inside the same preflight, before anything runs.
     let top_sid = req.session_id.clone();
-    let admitted = match preflight_all(&state, top_sid.as_ref(), &mut req.steps).await {
+    let registry = state.registry.read().await.clone();
+    let admitted = match preflight_all(&state, &registry, top_sid.as_ref(), &req.steps).await {
         Ok(items) => items,
         Err(resp) => return resp,
     };
     let continue_on_error = req.continue_on_error.unwrap_or(false);
     let total = admitted.len();
-    let inner: Vec<(String, serde_json::Value)> = admitted
-        .into_iter()
-        .map(|item| (item.tool, item.args))
+    let contracts: Vec<ExecutionContract> = admitted
+        .iter()
+        .map(|call| call.contract().clone())
         .collect();
     state.metrics.inc_request();
-    let registry = state.registry.read().await.clone();
-    let results = registry.execute_sequence(inner, continue_on_error).await;
+    let results = registry.execute_sequence(admitted, continue_on_error).await;
     let executed = results.len();
     let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity(results.len());
-    for r in results {
+    for (r, contract) in results.into_iter().zip(contracts) {
         match r {
             Ok(o) => {
                 // One audit record per executed step, as in `execute`.
-                outcomes.push(record_outcome(&state, &o, o.duration_ms).await);
+                // Steps never replay: each owns its admitted id.
+                outcomes.push(
+                    record_outcome(
+                        &state,
+                        &o,
+                        ExecAttribution {
+                            contract: &contract,
+                            replayed: false,
+                            execution_id: contract.execution_id(),
+                        },
+                        o.duration_ms,
+                    )
+                    .await,
+                );
             }
             Err(e) => {
                 state.metrics.observe_with_tool("", false, 0);
@@ -1205,7 +1261,7 @@ async fn execute_stream(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-    Json(mut req): Json<ExecuteRequest>,
+    Json(req): Json<ExecuteRequest>,
 ) -> Response {
     if let Some(resp) = admit_edge(&headers, peer.map(|p| p.0), &state) {
         return resp;
@@ -1215,19 +1271,40 @@ async fn execute_stream(
         Ok(permit) => permit,
         Err(resp) => return resp,
     };
-    // A caller-supplied scope root is untrusted: the coordinator drops it
-    // before admission, admits session + egress, and binds the trusted root —
-    // identical to `execute`, so a streamed call can never skip what a
-    // single call checks.
-    let item = match prepare_one(&state, req.session_id.as_ref(), &req.tool, &mut req.args).await {
-        Ok(item) => item,
+    // Admission binds the execution contract identically to `execute`, so
+    // a streamed call can never skip what a single call checks — including
+    // the replay identity that keeps stream/execute retries coherent.
+    let registry = state.registry.read().await.clone();
+    let call = match prepare_one(
+        &state,
+        &registry,
+        req.session_id.as_ref(),
+        &req.tool,
+        &req.args,
+    )
+    .await
+    {
+        Ok(call) => call,
         Err(resp) => return resp,
     };
 
     let started = Instant::now();
-    let registry = state.registry.read().await.clone();
-    let outcome = match run_one(&registry, item, req.idempotency_key).await {
-        Ok(o) => o,
+    let attribution = call.contract().clone();
+    let outcome = match run_one(&registry, call, req.idempotency_key).await {
+        Ok(ran) => {
+            let _ = record_outcome(
+                &state,
+                &ran.outcome,
+                ExecAttribution {
+                    contract: &attribution,
+                    replayed: ran.replayed,
+                    execution_id: &ran.execution_id,
+                },
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            ran.outcome
+        }
         Err(e) => {
             let err_event = Event::default()
                 .event("error")
@@ -1236,9 +1313,6 @@ async fn execute_stream(
             return Sse::new(stream).into_response();
         }
     };
-
-    // Audit + metrics exactly as `execute`: one record per executed tool.
-    let _ = record_outcome(&state, &outcome, started.elapsed().as_millis() as u64).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
 
@@ -1320,7 +1394,12 @@ fn extract_code(msg: &str) -> String {
     msg.split(':').next().unwrap_or(msg).trim().to_string()
 }
 
-async fn audit_log(state: &AppState, outcome: &ToolOutcome, _elapsed: u64) {
+async fn audit_log(
+    state: &AppState,
+    outcome: &ToolOutcome,
+    exec: ExecAttribution<'_>,
+    _elapsed: u64,
+) {
     let entry = serde_json::json!({
         "ts": chrono_like_now(),
         "tool": outcome.tool,
@@ -1330,6 +1409,16 @@ async fn audit_log(state: &AppState, outcome: &ToolOutcome, _elapsed: u64) {
         "summary": outcome.summary,
         "content_sha256": outcome.content.as_ref().map(|b| crate::sha256_hex(b)),
         "redaction_policy_version": crate::REDACTION_POLICY_VERSION,
+        // One execution identity shared by dispatch and audit: the
+        // originating id (replays reference the stored origin — a replay
+        // never mints a side effect, so it never mints an id for one), the
+        // replay fingerprint and policy snapshot (both digests, safe to
+        // record), and whether this record is a new execution or a replay
+        // of one.
+        "execution_id": exec.execution_id,
+        "request_fingerprint": exec.contract.request_fingerprint(),
+        "policy_identity": exec.contract.policy_identity(),
+        "execution_status": if exec.replayed { "replayed" } else { "executed" },
     });
     let line = serde_json::to_string(&entry).unwrap_or_default();
     tracing::info!(audit = %line, "audit");
@@ -1458,7 +1547,17 @@ pub fn build_registry_from_policy(policy: &ExecutionPolicy) -> anyhow::Result<To
         registry.register(std::sync::Arc::new(policy.system_tool()));
     }
 
-    Ok(registry)
+    // The registry snapshot carries its own identity: the content hash of
+    // the effective policy. Admission copies it into every execution
+    // contract, so audit records say under which policy each execution ran
+    // and a hot reload visibly retires the old snapshot.
+    let policy_identity = crate::sha256_hex(
+        crate::execution::canonical_json(
+            &serde_json::to_value(policy).map_err(|e| anyhow::anyhow!("policy_identity: {e}"))?,
+        )
+        .as_bytes(),
+    );
+    Ok(registry.with_policy_identity(policy_identity))
 }
 /// How to run the service.
 ///

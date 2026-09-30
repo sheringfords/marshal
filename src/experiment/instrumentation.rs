@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 #[allow(unused_imports)]
-use crate::{ToolOutcome, ToolRegistry};
+use crate::{ContractedCall, ToolOutcome, ToolRegistry};
 
 use super::recorder::TaskRecorder;
 
@@ -105,8 +105,13 @@ pub async fn instrument_batch(
         let _ = recorder.tool_call_started(format!("call_{idx}"), turn.clone(), tool, op, ib);
     }
     let workload = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency.clamp(1, 32)));
+    // Experiment harness: explicit trusted-local calls, no HTTP admission.
+    let contracted: Vec<ContractedCall> = requests
+        .iter()
+        .map(|(tool, args)| ContractedCall::local(registry, tool, args.clone()))
+        .collect();
     let results = registry
-        .execute_batch(requests.clone(), max_concurrency, &workload)
+        .execute_batch(contracted, max_concurrency, &workload)
         .await;
     for (idx, res) in results.iter().enumerate() {
         let (tool, args) = &requests[idx];
@@ -174,8 +179,13 @@ pub async fn instrument_sequence(
         let ib = Some(serde_json::to_string(args).unwrap_or_default().len());
         let _ = recorder.tool_call_started(format!("call_s{idx}"), turn.clone(), tool, op, ib);
     }
+    // Experiment harness: explicit trusted-local calls, no HTTP admission.
+    let contracted: Vec<ContractedCall> = requests
+        .iter()
+        .map(|(tool, args)| ContractedCall::local(registry, tool, args.clone()))
+        .collect();
     let results = registry
-        .execute_sequence(requests.clone(), continue_on_error)
+        .execute_sequence(contracted, continue_on_error)
         .await;
     for (idx, res) in results.iter().enumerate() {
         let (tool, args) = &requests[idx];
@@ -250,7 +260,11 @@ pub async fn instrument_execute_once(
         input_bytes,
     );
     let started = std::time::Instant::now();
-    let res = registry.execute_once(key, tool, args).await;
+    // Experiment harness: explicit trusted-local call, no HTTP admission.
+    let res = registry
+        .execute_once(key, ContractedCall::local(registry, tool, args))
+        .await
+        .map(|r| r.outcome);
     let elapsed = started.elapsed().as_millis() as u64;
     match res {
         Ok(outcome) => {
